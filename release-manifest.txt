@@ -1,0 +1,12 @@
+source_commit=13a4561c3930adf65e3d7d4e37a64cdbfac0a98d
+package_name=xhttp-cdn-deploy
+xray_version_at_build=v26.10.29
+xray_source=https://github.com/XTLS/Xray-core/releases/tag/v26.10.29
+xray_installer_commit=e42df6a772e60dd7b058f852262c4dbeb0bc231d
+xray_installer_source=https://github.com/XTLS/Xray-install/tree/e42df6a772e60dd7b058f852262c4dbeb0bc231d
+acme_version_at_build=3.1.6
+acme_source=https://github.com/acmesh-official/acme.sh/releases/tag/3.1.6
+debian_packages=official-debian-repository
+files_sha256:
+5ea61948023988339ed108aeb69bee3f99cc8ae31d56c5221cb64f851a3afd80  deploy.sh
+049ca8956ac850a093d53e93d62d56dffbd35da15e53a59a9d0329e657b7cf87  README.md
