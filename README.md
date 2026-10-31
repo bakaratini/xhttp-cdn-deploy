@@ -139,6 +139,8 @@ Cloudflare 默认不会缓存 POST，但 XHTTP 路径建议明确加入 Cache Ru
 
 脚本不会停止或接管 1Panel、OpenResty、Nginx Proxy Manager 等已有服务。CDN 公网端口已经由同一个 Nginx 服务监听时，脚本会尝试复用它，但要求该服务实际加载 `/etc/nginx/conf.d/xhttp-cdn-deploy.conf`。如果公网端口被其他进程占用，脚本只跳过对应 CDN 端口；对应本机 Xray 转发端口被占用时也会跳过该端口。Reality 直连端口及其本机回落端口冲突会停止部署。
 
+工具不使用公网 TCP `80`。安装 Debian Nginx 后，脚本只会禁用指向系统默认文件的 `/etc/nginx/sites-enabled/default` 链接，避免该默认站点与已有面板服务争用 `80`；默认文件本身和其他站点配置不会删除。卸载时会恢复部署前存在的默认链接；如果链接在部署后被人工修改，卸载会保留并报告它。
+
 ## TLS 证书
 
 ### 推荐：acme.sh DNS-01

@@ -30,6 +30,7 @@ PROMPT_FD=0
 STATE_DIR="/etc/xhttp-cdn-deploy"
 XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"
 NGINX_CONF_PATH="/etc/nginx/conf.d/xhttp-cdn-deploy.conf"
+NGINX_DEFAULT_SITE_PATH="/etc/nginx/sites-enabled/default"
 CLIENT_DIR="/root/xhttp-cdn-deploy"
 CLIENT_FILE="${CLIENT_DIR}/client-v2rayn.txt"
 CERT_DIR="${STATE_DIR}/tls"
@@ -56,6 +57,8 @@ ACME_CERT_ISSUED_BY_TOOL=0
 ACME_DOMAIN=""
 XRAY_CONFIG_BACKUP=""
 NGINX_CONFIG_BACKUP=""
+NGINX_DEFAULT_SITE_TARGET=""
+NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=0
 CLIENT_FILE_BACKUP=""
 SITE_DIR_CREATED_BY_TOOL=0
 SITE_INDEX_CREATED_BY_TOOL=0
@@ -468,6 +471,7 @@ install_packages() {
   installed_packages="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' |
     awk -F '\t' '$2 == "installed" { print $1 }' | sort -u)"
   OWNED_PACKAGES="$(comm -13 "${STATE_DIR}/packages.before" <(printf '%s\n' "$installed_packages" | sed '/^$/d'))"
+  disable_stock_nginx_site
   write_install_state
 }
 
@@ -500,6 +504,8 @@ write_install_state() {
     printf 'PACKAGE_BASELINE_FILE=%q\n' "$PACKAGE_BASELINE_FILE"
     printf 'XRAY_CONFIG_BACKUP=%q\n' "$XRAY_CONFIG_BACKUP"
     printf 'NGINX_CONFIG_BACKUP=%q\n' "$NGINX_CONFIG_BACKUP"
+    printf 'NGINX_DEFAULT_SITE_TARGET=%q\n' "$NGINX_DEFAULT_SITE_TARGET"
+    printf 'NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=%q\n' "$NGINX_DEFAULT_SITE_DISABLED_BY_TOOL"
     printf 'CLIENT_FILE_BACKUP=%q\n' "$CLIENT_FILE_BACKUP"
     printf 'CLIENT_FILE_CREATED_BY_TOOL=%q\n' "$([[ -z "$CLIENT_FILE_BACKUP" ]] && printf 1 || printf 0)"
     printf 'SITE_DIR_CREATED_BY_TOOL=%q\n' "$SITE_DIR_CREATED_BY_TOOL"
@@ -523,6 +529,29 @@ backup_file() {
   printf -v "$variable" '%s' "$backup"
 }
 
+stock_nginx_site_target() {
+  printf '%s/sites-available/default' "$(dirname "$(dirname "$NGINX_DEFAULT_SITE_PATH")")"
+}
+
+stock_nginx_site_enabled() {
+  local target expected
+  [[ -L "$NGINX_DEFAULT_SITE_PATH" ]] || return 1
+  target="$(readlink -f "$NGINX_DEFAULT_SITE_PATH" 2>/dev/null || true)"
+  expected="$(stock_nginx_site_target)"
+  [[ -n "$target" && "$target" == "$expected" ]]
+}
+
+disable_stock_nginx_site() {
+  (( DRY_RUN )) && return 0
+  if ! stock_nginx_site_enabled; then
+    return 0
+  fi
+  NGINX_DEFAULT_SITE_TARGET="${NGINX_DEFAULT_SITE_TARGET:-$(readlink "$NGINX_DEFAULT_SITE_PATH")}"
+  rm -f "$NGINX_DEFAULT_SITE_PATH"
+  NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=1
+  log "disabled the Debian default Nginx site; the deployment does not use TCP port 80"
+}
+
 initialize_install_state() {
   (( DRY_RUN )) && return 0
   if [[ -e "$STATE_DIR" ]]; then
@@ -538,6 +567,7 @@ initialize_install_state() {
     [[ -f "$PACKAGE_BASELINE_FILE" ]] || die "the package baseline is missing; cannot safely resume"
     [[ ! -e /usr/local/bin/xray && ! -e /usr/local/etc/xray && ! -e /etc/systemd/system/xray.service ]] ||
       die "Xray installation has already started; use uninstall.sh before retrying"
+    disable_stock_nginx_site
     REALITY_DOMAIN="$state_reality_domain"
     log "resuming an incomplete dependency setup"
     return 0
@@ -547,6 +577,7 @@ initialize_install_state() {
     awk -F '\t' '$2 == "installed" { print $1 }' | sort -u > "$PACKAGE_BASELINE_FILE"
   backup_file "$XRAY_CONFIG_PATH" XRAY_CONFIG_BACKUP
   backup_file "$NGINX_CONF_PATH" NGINX_CONFIG_BACKUP
+  disable_stock_nginx_site
   backup_file "$CLIENT_FILE" CLIENT_FILE_BACKUP
   [[ -d "$SITE_DIR" ]] || SITE_DIR_CREATED_BY_TOOL=1
   if ! getent passwd xray >/dev/null; then XRAY_USER_CREATED_BY_TOOL=1; fi
@@ -1019,7 +1050,7 @@ validate_services() {
 }
 
 report_service_failure() {
-  local service="$1"
+  local service="$1" nginx_listeners
   printf '[ERROR] %s service diagnostics:\n' "$service" >&2
   systemctl status "$service" --no-pager -l >&2 || true
   if command -v journalctl >/dev/null 2>&1; then
@@ -1027,6 +1058,13 @@ report_service_failure() {
   fi
   if command -v ss >/dev/null 2>&1; then
     ss -ltnp >&2 || true
+  fi
+  if [[ "$service" == nginx ]] && command -v nginx >/dev/null 2>&1; then
+    nginx_listeners="$(nginx -T 2>&1 | grep -nE 'listen[[:space:]]+(\[::\]:)?80([;[:space:]])' || true)"
+    if [[ -n "$nginx_listeners" ]]; then
+      printf '[ERROR] the active Nginx configuration still declares TCP port 80:\n%s\n' \
+        "$nginx_listeners" >&2
+    fi
   fi
 }
 

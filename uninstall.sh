@@ -9,6 +9,7 @@ LOCK_FILE="/run/lock/${APP_NAME}.lock"
 INSTALL_STATE_FILE="${STATE_DIR}/install-state.env"
 XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"
 NGINX_CONF_PATH="/etc/nginx/conf.d/${APP_NAME}.conf"
+NGINX_DEFAULT_SITE_PATH="/etc/nginx/sites-enabled/default"
 CLIENT_FILE="/root/${APP_NAME}/client-v2rayn.txt"
 CLIENT_DIR="/root/${APP_NAME}"
 SITE_DIR="/var/www/${APP_NAME}"
@@ -22,6 +23,7 @@ FILE_PRESERVED=0
 PRESERVE_NGINX=0
 PRESERVE_TLS=0
 PRESERVE_ACME=0
+NGINX_DEFAULT_SITE_PRESERVED=0
 XRAY_REMOVED=0
 PRESERVE_XRAY=0
 
@@ -98,6 +100,8 @@ show_plan() {
   (( XRAY_INSTALLED_BY_TOOL )) && printf '  Xray installation artifacts, if present\n'
   printf '  Nginx configuration: %s\n' "$NGINX_CONF_PATH"
   printf '  Client link and tool-created site files\n'
+  [[ "${NGINX_DEFAULT_SITE_DISABLED_BY_TOOL:-0}" == 1 ]] &&
+    printf '  Debian default Nginx site link (restore if it was present before deployment)\n'
   printf '  Local state, certificate copies, and saved deployment credentials\n'
   (( ACME_CERT_ISSUED_BY_TOOL )) && printf '  ACME certificate lineage for %s\n' "${ACME_DOMAIN:-unknown}"
   [[ -n "${OWNED_PACKAGES:-}" ]] && printf '  Newly installed Debian packages, subject to dependency checks\n'
@@ -155,8 +159,40 @@ restore_or_remove_file() {
   fi
 }
 
+restore_nginx_default_site() {
+  [[ "${NGINX_DEFAULT_SITE_DISABLED_BY_TOOL:-0}" == 1 ]] || return 0
+  local destination original_target
+  destination="$(path_of "$NGINX_DEFAULT_SITE_PATH")"
+  original_target="${NGINX_DEFAULT_SITE_TARGET:-}"
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    if [[ -n "$original_target" && -L "$destination" &&
+          "$(readlink "$destination")" == "$original_target" ]]; then
+      return 0
+    fi
+    warn "$NGINX_DEFAULT_SITE_PATH changed after deployment; preserving it"
+    NGINX_DEFAULT_SITE_PRESERVED=1
+    RETAINED_RESOURCES+=("$NGINX_DEFAULT_SITE_PATH (changed after deployment)")
+    return 0
+  fi
+
+  if [[ -n "$original_target" ]]; then
+    install -d -m 755 "$(dirname "$destination")"
+    ln -s "$original_target" "$destination"
+    log "restored $NGINX_DEFAULT_SITE_PATH"
+  fi
+}
+
+standard_xray_dropin() {
+  local path="$1" normalized
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  normalized="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+    -e 's/[[:space:]]*$//' "$path")" || return 1
+  [[ "$normalized" == $'[Service]\nExecStart=\nExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' ]]
+}
+
 xray_is_safe_to_remove() {
-  local config_path config_dir current_hash extra service_path service_hash binary_path binary_hash dropin
+  local config_path config_dir current_hash extra service_path service_hash binary_path binary_hash dropin standard_path
   config_path="$(path_of "$XRAY_CONFIG_PATH")"
   config_dir="$(dirname "$config_path")"
   if [[ -e "$config_path" ]]; then
@@ -208,7 +244,14 @@ xray_is_safe_to_remove() {
   fi
   for dropin in /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d; do
     dropin="$(path_of "$dropin")"
-    if [[ -d "$dropin" ]] && find "$dropin" -type f -print -quit | grep -q .; then
+    [[ -d "$dropin" ]] || continue
+    standard_path="${dropin}/10-donot_touch_single_conf.conf"
+    extra="$(find "$dropin" -mindepth 1 -maxdepth 1 ! -path "$standard_path" -print -quit)"
+    if [[ -n "$extra" ]]; then
+      warn "Xray systemd overrides exist; preserving Xray"
+      return 1
+    fi
+    if [[ -e "$standard_path" || -L "$standard_path" ]] && ! standard_xray_dropin "$standard_path"; then
       warn "Xray systemd overrides exist; preserving Xray"
       return 1
     fi
@@ -512,6 +555,7 @@ main() {
       PRESERVE_TLS=1
     fi
   fi
+  restore_nginx_default_site
   restore_or_remove_file "$CLIENT_FILE" "${CLIENT_FILE_BACKUP:-}" "${CLIENT_FILE_CREATED_BY_TOOL:-1}" "${CLIENT_FILE_SHA256:-}"
   remove_acme_lineage
   remove_acme_installation_if_exclusive

@@ -13,6 +13,7 @@ LOCK_FILE="/run/lock/${APP_NAME}.lock"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 NGINX_CONFIG="/etc/nginx/conf.d/${APP_NAME}.conf"
+NGINX_DEFAULT_SITE_PATH="/etc/nginx/sites-enabled/default"
 ACME_HOME="/root/.acme.sh"
 ACME_INSTALL_URL="https://get.acme.sh"
 DEBIAN_PACKAGES=(ca-certificates curl cron iproute2 jq nginx openssl unzip)
@@ -32,6 +33,8 @@ NGINX_VERSION_INSTALLED=""
 DEBIAN_PACKAGE_VERSIONS=""
 COMPONENTS_UPDATED_UTC=""
 XRAY_SERVICE_CUSTOM=0
+NGINX_DEFAULT_SITE_TARGET=""
+NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -66,6 +69,22 @@ path_of() {
   else
     printf '%s' "$value"
   fi
+}
+
+stock_nginx_site_target() {
+  printf '%s/sites-available/default' "$(dirname "$(dirname "$NGINX_DEFAULT_SITE_PATH")")"
+}
+
+disable_stock_nginx_site() {
+  local target expected
+  [[ -L "$(path_of "$NGINX_DEFAULT_SITE_PATH")" ]] || return 0
+  target="$(readlink -f "$(path_of "$NGINX_DEFAULT_SITE_PATH")" 2>/dev/null || true)"
+  expected="$(stock_nginx_site_target)"
+  [[ -n "$target" && "$target" == "$(path_of "$expected")" ]] || return 0
+  NGINX_DEFAULT_SITE_TARGET="${NGINX_DEFAULT_SITE_TARGET:-$(readlink "$(path_of "$NGINX_DEFAULT_SITE_PATH")")}"
+  rm -f "$(path_of "$NGINX_DEFAULT_SITE_PATH")"
+  NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=1
+  log "disabled the Debian default Nginx site; the deployment does not use TCP port 80"
 }
 
 require_environment() {
@@ -210,6 +229,8 @@ write_state() {
     printf 'PACKAGE_BASELINE_FILE=%q\n' "$PACKAGE_BASELINE_FILE"
     printf 'XRAY_CONFIG_BACKUP=%q\n' "$XRAY_CONFIG_BACKUP"
     printf 'NGINX_CONFIG_BACKUP=%q\n' "$NGINX_CONFIG_BACKUP"
+    printf 'NGINX_DEFAULT_SITE_TARGET=%q\n' "$NGINX_DEFAULT_SITE_TARGET"
+    printf 'NGINX_DEFAULT_SITE_DISABLED_BY_TOOL=%q\n' "$NGINX_DEFAULT_SITE_DISABLED_BY_TOOL"
     printf 'CLIENT_FILE_BACKUP=%q\n' "$CLIENT_FILE_BACKUP"
     printf 'CLIENT_FILE_CREATED_BY_TOOL=%q\n' "$CLIENT_FILE_CREATED_BY_TOOL"
     printf 'SITE_DIR_CREATED_BY_TOOL=%q\n' "$SITE_DIR_CREATED_BY_TOOL"
@@ -443,6 +464,8 @@ main() {
   write_state || die "could not record resolved component versions before updating"
 
   refresh_debian_packages || die "Debian dependency update failed"
+  disable_stock_nginx_site
+  write_state || die "could not record the Nginx default site state"
   restart_nginx || die "Nginx configuration or service failed after Debian package update"
   refresh_acme || die "acme.sh update failed; Debian package updates remain applied"
   refresh_xray || die "Xray update failed; previous Xray binary was restored when possible"
