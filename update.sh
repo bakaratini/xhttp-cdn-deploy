@@ -15,7 +15,7 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 NGINX_CONFIG="/etc/nginx/conf.d/${APP_NAME}.conf"
 ACME_HOME="/root/.acme.sh"
 ACME_INSTALL_URL="https://get.acme.sh"
-DEBIAN_PACKAGES=(ca-certificates curl cron jq nginx openssl unzip)
+DEBIAN_PACKAGES=(ca-certificates curl cron iproute2 jq nginx openssl unzip)
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -169,11 +169,11 @@ capture_versions() {
   local xray_path acme_path
   xray_path="$(path_of "$XRAY_BIN")"
   acme_path="$(path_of "${ACME_HOME}/acme.sh")"
-  XRAY_VERSION_INSTALLED="$("$xray_path" version 2>/dev/null | head -n1)"
+  XRAY_VERSION_INSTALLED="$("$xray_path" version 2>/dev/null | sed -n '1p')"
   NGINX_VERSION_INSTALLED="$(nginx -v 2>&1)"
   DEBIAN_PACKAGE_VERSIONS="$(dpkg-query -W -f='${binary:Package}=${Version}\n' "${DEBIAN_PACKAGES[@]}" | sort)"
   if [[ -x "$acme_path" ]]; then
-    ACME_VERSION_INSTALLED="$("$acme_path" --version 2>/dev/null | tail -n1)"
+    ACME_VERSION_INSTALLED="$("$acme_path" --version 2>/dev/null | sed -n '$p')"
   else
     ACME_VERSION_INSTALLED="unavailable"
   fi
@@ -280,7 +280,7 @@ refresh_acme() {
     write_state || true
     return 1
   }
-  ACME_VERSION_INSTALLED="$("$acme_path" --version 2>/dev/null | tail -n1)"
+  ACME_VERSION_INSTALLED="$("$acme_path" --version 2>/dev/null | sed -n '$p')"
   [[ "$ACME_VERSION_INSTALLED" == *"$ACME_VERSION"* ]] || {
     warn "acme.sh did not report the requested stable release $ACME_VERSION"
     capture_versions || true
@@ -375,7 +375,7 @@ refresh_xray() {
   if [[ "${XHTTP_UPDATE_TEST_MODE:-0}" == 1 ]]; then
     XRAY_VERSION_INSTALLED="$(cat "$(path_of /usr/local/share/xray/.test-version)")"
   else
-    XRAY_VERSION_INSTALLED="$("$binary_path" version 2>/dev/null | head -n1)"
+    XRAY_VERSION_INSTALLED="$("$binary_path" version 2>/dev/null | sed -n '1p')"
   fi
   xray_version_matches_target "$XRAY_VERSION_INSTALLED" || {
     warn "installed Xray version does not match latest stable release $XRAY_VERSION"

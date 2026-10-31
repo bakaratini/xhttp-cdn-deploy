@@ -10,6 +10,8 @@ DEFAULT_SHORT_ID="a1234567"
 DEFAULT_XHTTP_PATH="/xhttp"
 PORTS=(2053 2083 2087 2096)
 CDN_PORTS=("${PORTS[@]}")
+SKIPPED_CDN_PORTS=()
+declare -A CDN_SKIP_REASONS=()
 ACME_INSTALL_URL="https://get.acme.sh"
 XRAY_INSTALL_REF=""
 XRAY_VERSION=""
@@ -19,7 +21,7 @@ ACME_VERSION_INSTALLED="unavailable"
 NGINX_VERSION_INSTALLED=""
 DEBIAN_PACKAGE_VERSIONS=""
 COMPONENTS_UPDATED_UTC=""
-DEBIAN_PACKAGES=(ca-certificates curl cron jq nginx openssl unzip)
+DEBIAN_PACKAGES=(ca-certificates curl cron iproute2 jq nginx openssl unzip)
 
 DRY_RUN=0
 DRY_RUN_OUTPUT=""
@@ -227,12 +229,128 @@ detect_ipv4() {
   fi
 }
 
+port_listener_details() {
+  local port="$1" hex matches
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true
+    return 0
+  fi
+
+  hex="$(printf '%04X' "$port")"
+  matches="$(awk -v wanted="$hex" '
+    NR > 1 {
+      split($2, endpoint, ":")
+      if (toupper(endpoint[2]) == wanted) print
+    }
+  ' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
+  if [[ -n "$matches" ]]; then
+    printf 'listener on TCP port %s (process owner unavailable; iproute2/ss is not installed)\n' "$port"
+  fi
+}
+
+listener_is_nginx() {
+  local details="$1" line marker='users:(("nginx",'
+  [[ -n "$details" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == *"$marker"* ]] || return 1
+  done <<< "$details"
+}
+
+check_required_port() {
+  local port="$1" allow_nginx="$2" details
+  details="$(port_listener_details "$port")"
+  [[ -z "$details" ]] && return 0
+  if (( allow_nginx )) && listener_is_nginx "$details"; then
+    log "reusing Nginx listener on local TCP port ${port}"
+    return 0
+  fi
+  printf '[ERROR] TCP port %s is already in use:\n%s\n' "$port" "$details" >&2
+  return 1
+}
+
+check_reality_ports() {
+  (( DRY_RUN )) && return 0
+  check_required_port "$DIRECT_PORT" 0 || {
+    printf '[ERROR] Reality 直连端口被占用，无法跳过唯一的直连节点。\n' >&2
+    return 1
+  }
+  check_required_port "$((DIRECT_PORT + 10000))" 1 || {
+    printf '[ERROR] Reality 回落端口被非 Nginx 服务占用，无法安全启动直连节点。\n' >&2
+    return 1
+  }
+}
+
+select_cdn_ports() {
+  local port internal_port details reason
+  CDN_PORTS=()
+  SKIPPED_CDN_PORTS=()
+  CDN_SKIP_REASONS=()
+
+  if (( DRY_RUN )); then
+    CDN_PORTS=("${PORTS[@]}")
+    return 0
+  fi
+
+  for port in "${PORTS[@]}"; do
+    internal_port=$((port + 10000))
+    reason=""
+    details="$(port_listener_details "$port")"
+    if [[ -n "$details" ]] && ! listener_is_nginx "$details"; then
+      reason="公网端口 ${port} 已被非 Nginx 服务占用"
+    fi
+    details="$(port_listener_details "$internal_port")"
+    if [[ -n "$details" ]]; then
+      if [[ -n "$reason" ]]; then
+        reason+="；本机转发端口 ${internal_port} 也已被占用"
+      else
+        reason="本机转发端口 ${internal_port} 已被占用"
+      fi
+    fi
+    if [[ -n "$reason" ]]; then
+      SKIPPED_CDN_PORTS+=("$port")
+      CDN_SKIP_REASONS["$port"]="$reason"
+      printf '[WARN] 跳过 CDN 端口 %s：%s。\n' "$port" "$reason" >&2
+    else
+      CDN_PORTS+=("$port")
+    fi
+  done
+
+  if ((${#CDN_PORTS[@]} == 0)); then
+    printf '[WARN] 四个 CDN 端口均不可用，将只部署 Reality 直连节点。\n' >&2
+  fi
+}
+
+cdn_uuid_for_port() {
+  case "$1" in
+    2053) printf '%s' "${UUIDS[1]}" ;;
+    2083) printf '%s' "${UUIDS[2]}" ;;
+    2087) printf '%s' "${UUIDS[3]}" ;;
+    2096) printf '%s' "${UUIDS[4]}" ;;
+    *) return 1 ;;
+  esac
+}
+
+cdn_node_name_for_port() {
+  case "$1" in
+    2053) printf '%s' "${NODE_NAMES[1]}" ;;
+    2083) printf '%s' "${NODE_NAMES[2]}" ;;
+    2087) printf '%s' "${NODE_NAMES[3]}" ;;
+    2096) printf '%s' "${NODE_NAMES[4]}" ;;
+    *) return 1 ;;
+  esac
+}
+
+ports_as_space_list() {
+  local IFS=' '
+  printf '%s' "$*"
+}
+
 collect_inputs() {
   local detected_ip port value index previous prompt_label
   REALITY_DOMAIN=""
   CDN_DOMAIN=""
 
-  printf '\n%s\n' "${APP_NAME}: one Reality node and four CDN nodes"
+  printf '\n%s\n' "${APP_NAME}: one Reality node and up to four CDN nodes"
   printf '%s\n' "请将 a2 灰云域名用于 Reality；a1 橙云域名用于四个 CDN 端口。证书同时覆盖两者。"
   while :; do
     prompt_value REALITY_DOMAIN "Reality 灰云域名（a2）/ SNI"
@@ -278,6 +396,9 @@ collect_inputs() {
     if valid_ipv4 "$VPS_IPV4"; then break; fi
     printf '[ERROR] IPv4 地址格式无效，请重新输入。\n' >&2
   done
+
+  check_reality_ports || die "Reality 直连端口检查失败"
+  select_cdn_ports
 
   while :; do
     UUIDS=()
@@ -327,7 +448,7 @@ collect_inputs() {
     printf '[ERROR] XHTTP 路径格式无效，请重新输入。\n' >&2
   done
 
-  prompt_value NODE_ALIAS_BASE "五个节点的基础别名（将自动追加端口号）" "xhttp"
+  prompt_value NODE_ALIAS_BASE "节点的基础别名（将自动追加端口号）" "xhttp"
   NODE_NAMES=(
     "${NODE_ALIAS_BASE}-${DIRECT_PORT}"
     "${NODE_ALIAS_BASE}-2053"
@@ -458,7 +579,7 @@ install_xray() {
   [[ -x /usr/local/bin/xray ]] || die "Xray installation did not produce /usr/local/bin/xray"
   [[ -f /usr/local/bin/xray && ! -L /usr/local/bin/xray ]] || die "Xray binary is not a regular file"
   XRAY_BINARY_SHA256="$(sha256sum /usr/local/bin/xray | awk '{print $1}')"
-  XRAY_VERSION_INSTALLED="$(/usr/local/bin/xray version 2>/dev/null | head -n1)"
+  XRAY_VERSION_INSTALLED="$(/usr/local/bin/xray version 2>/dev/null | sed -n '1p')"
   if [[ -f "$XRAY_CONFIG_PATH" && ! -L "$XRAY_CONFIG_PATH" ]]; then
     XRAY_CONFIG_SHA256="$(sha256sum "$XRAY_CONFIG_PATH" | awk '{print $1}')"
   fi
@@ -573,7 +694,7 @@ ensure_acme() {
   rm -f "$installer"
   ACME_BIN="$ACME_HOME/acme.sh"
   [[ -x "$ACME_BIN" ]] || die "acme.sh installation failed"
-  ACME_VERSION_INSTALLED="$("$ACME_BIN" --version 2>/dev/null | tail -n1)"
+  ACME_VERSION_INSTALLED="$("$ACME_BIN" --version 2>/dev/null | sed -n '$p')"
 }
 
 prepare_certificate() {
@@ -659,7 +780,7 @@ EOF
 }
 
 render_xray_config() {
-  local inbounds inbound port target internal_port index uuid
+  local inbounds inbound port target internal_port uuid
   inbounds='[]'
 
   target="127.0.0.1:$((DIRECT_PORT + 10000))"
@@ -674,10 +795,9 @@ render_xray_config() {
     '{listen:"0.0.0.0", port:$port, protocol:"vless", settings:{clients:[{id:$id, level:0}], decryption:"none"}, streamSettings:{network:"xhttp", security:"reality", realitySettings:{show:false, target:$target, xver:0, serverNames:[$reality_domain], privateKey:$private_key, shortIds:[$short_id]}, xhttpSettings:{host:"", path:$path, mode:"auto"}}, sniffing:{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}}')"
   inbounds="$(jq -cn --argjson all "$inbounds" --argjson one "$inbound" '$all + [$one]')"
 
-  for index in 0 1 2 3; do
-    port="${PORTS[$index]}"
+  for port in "${CDN_PORTS[@]}"; do
     internal_port=$((port + 10000))
-    uuid="${UUIDS[$((index + 1))]}"
+    uuid="$(cdn_uuid_for_port "$port")"
     inbound="$(jq -cn \
       --arg id "$uuid" \
       --argjson port "$internal_port" \
@@ -806,7 +926,7 @@ url_encode() {
 }
 
 render_client_links() {
-  local direct_server encoded_path port index extra encoded_extra name xmux uuid default_name
+  local direct_server encoded_path port extra encoded_extra name xmux uuid default_name
   direct_server="$VPS_IPV4"
   encoded_path="$(url_encode "$XHTTP_PATH")"
   xmux='{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}'
@@ -821,11 +941,11 @@ render_client_links() {
     "$(url_encode "$REALITY_DOMAIN")" "$(url_encode "$PUBLIC_KEY")" \
     "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$(url_encode "$name")" >> "$CLIENT_FILE"
 
-  for index in 0 1 2 3; do
-    port="${PORTS[$index]}"
-    uuid="${UUIDS[$((index + 1))]}"
+  for port in "${CDN_PORTS[@]}"; do
+    uuid="$(cdn_uuid_for_port "$port")"
     default_name="xhttp-tls-cdn-${port}"
-    name="${NODE_NAMES[$((index + 1))]:-$default_name}"
+    name="$(cdn_node_name_for_port "$port")"
+    name="${name:-$default_name}"
     extra="$(jq -cn \
       --argjson xmux "$xmux" \
       '{xmux:$xmux}')"
@@ -857,6 +977,11 @@ write_state() {
     printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
     printf 'XHTTP_PATH=%q\n' "$XHTTP_PATH"
     printf 'NODE_ALIAS_BASE=%q\n' "$NODE_ALIAS_BASE"
+    printf 'CDN_PORTS_ACTIVE=%q\n' "$(ports_as_space_list "${CDN_PORTS[@]}")"
+    printf 'CDN_PORTS_SKIPPED=%q\n' "$(ports_as_space_list "${SKIPPED_CDN_PORTS[@]}")"
+    for port in "${SKIPPED_CDN_PORTS[@]}"; do
+      printf 'CDN_SKIP_REASON_%s=%q\n' "$port" "${CDN_SKIP_REASONS[$port]}"
+    done
     printf 'NODE_NAME_DIRECT=%q\n' "${NODE_NAMES[0]}"
     printf 'NODE_NAME_2053=%q\n' "${NODE_NAMES[1]}"
     printf 'NODE_NAME_2083=%q\n' "${NODE_NAMES[2]}"
@@ -869,9 +994,23 @@ write_state() {
   mv -f "$temporary" "$state_file"
 }
 
+validate_nginx_config_loaded() {
+  local nginx_dump
+  nginx_dump="$(nginx -T 2>&1)" || {
+    printf '[ERROR] Nginx configuration dump failed; existing Nginx/OpenResty configuration is not usable.\n%s\n' \
+      "$nginx_dump" >&2
+    return 1
+  }
+  if [[ "$nginx_dump" != *"configuration file ${NGINX_CONF_PATH}"* ]]; then
+    printf '[ERROR] the active Nginx configuration does not load %s\n' "$NGINX_CONF_PATH" >&2
+    return 1
+  fi
+}
+
 validate_services() {
   (( DRY_RUN )) && return 0
   nginx -t
+  validate_nginx_config_loaded || die "the active Nginx service does not load the tool configuration"
   /usr/local/bin/xray run -test -config "$XRAY_CONFIG_PATH"
   if [[ "$XRAY_SERVICE_USER" != root ]]; then
     runuser -u "$XRAY_SERVICE_USER" -- /usr/local/bin/xray run -test -config "$XRAY_CONFIG_PATH" ||
@@ -879,26 +1018,63 @@ validate_services() {
   fi
 }
 
+report_service_failure() {
+  local service="$1"
+  printf '[ERROR] %s service diagnostics:\n' "$service" >&2
+  systemctl status "$service" --no-pager -l >&2 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u "$service" -b -n 50 --no-pager >&2 || true
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp >&2 || true
+  fi
+}
+
 start_services() {
   (( DRY_RUN )) && return 0
   systemctl daemon-reload
-  systemctl enable nginx >/dev/null
-  systemctl enable xray >/dev/null
-  systemctl restart nginx
-  systemctl restart xray
-  systemctl is-active --quiet nginx || die "nginx did not become active"
-  systemctl is-active --quiet xray || die "xray did not become active"
+  if ! systemctl enable nginx >/dev/null; then
+    report_service_failure nginx
+    die "could not enable nginx.service"
+  fi
+  if ! systemctl enable xray >/dev/null; then
+    report_service_failure xray
+    die "could not enable xray.service"
+  fi
+  if ! systemctl restart nginx; then
+    report_service_failure nginx
+    die "nginx failed to restart; check existing Nginx/OpenResty/Nginx Proxy Manager port ownership"
+  fi
+  if ! systemctl restart xray; then
+    report_service_failure xray
+    die "xray failed to restart"
+  fi
+  if ! systemctl is-active --quiet nginx; then
+    report_service_failure nginx
+    die "nginx did not become active"
+  fi
+  if ! systemctl is-active --quiet xray; then
+    report_service_failure xray
+    die "xray did not become active"
+  fi
 }
 
 print_summary() {
+  local active_ports
+  active_ports="$(ports_as_space_list "${CDN_PORTS[@]}")"
+  active_ports="${active_ports:-无}"
   printf '\n部署完成。\n'
   printf '客户端链接：%s\n' "$CLIENT_FILE"
   printf 'Xray 配置： %s\n' "$XRAY_CONFIG_PATH"
   printf '状态文件：  %s\n' "${STATE_DIR}/config.env"
-  printf '\n请在 VPS / 云厂商防火墙放行 TCP 入站端口：%s %s\n' "${PORTS[*]}" "$DIRECT_PORT"
-  printf 'Cloudflare CDN 域名：%s（橙云，端口 %s）\n' "$CDN_DOMAIN" "${PORTS[*]}"
+  printf '\n请在 VPS / 云厂商防火墙放行 TCP 入站端口：%s %s\n' "$active_ports" "$DIRECT_PORT"
+  printf 'Cloudflare CDN 域名：%s（橙云，实际端口 %s）\n' "$CDN_DOMAIN" "$active_ports"
   printf '双向直连 Reality：TCP %s，SNI %s\n' "$DIRECT_PORT" "$REALITY_DOMAIN"
-  printf '双向经 CDN：TCP %s（域名 %s）\n\n' "${PORTS[*]}" "$CDN_DOMAIN"
+  printf '双向经 CDN：TCP %s（域名 %s）\n' "$active_ports" "$CDN_DOMAIN"
+  for port in "${SKIPPED_CDN_PORTS[@]}"; do
+    printf '已跳过 CDN 端口 %s：%s。\n' "$port" "${CDN_SKIP_REASONS[$port]}"
+  done
+  printf '\n'
   cat "$CLIENT_FILE"
 }
 
@@ -923,7 +1099,11 @@ main() {
   ensure_state_dirs
   prepare_certificate
   if (( ! DRY_RUN )) && [[ -x "$ACME_HOME/acme.sh" ]] && [[ "$ACME_VERSION_INSTALLED" == unavailable ]]; then
-    ACME_VERSION_INSTALLED="$("$ACME_HOME/acme.sh" --version 2>/dev/null | tail -n1)"
+    ACME_VERSION_INSTALLED="$("$ACME_HOME/acme.sh" --version 2>/dev/null | sed -n '$p')"
+  fi
+  if (( ! DRY_RUN )); then
+    check_reality_ports || die "Reality 直连端口检查失败"
+    select_cdn_ports
   fi
   write_site
   render_xray_config
