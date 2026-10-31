@@ -55,6 +55,7 @@ sudo bash /opt/xhttp-cdn-deploy/deploy.sh
 5. 一个自己的灰云 Reality 域名（记录名 `a2`）。
 6. 一个自己的橙云 CDN 域名（记录名 `a1`）。
 7. 一个 Cloudflare API Token，或者已经签发好的 CDN 域名证书和私钥。
+8. 一段节点基础别名；脚本会在末尾自动追加每个节点的端口号。
 
 UUID 可以在 Windows PowerShell 中运行下面命令五次，复制五行结果到部署提示。输入顺序是 Reality 直连、2053、2083、2087、2096；五条必须互不相同。
 
@@ -62,7 +63,7 @@ UUID 可以在 Windows PowerShell 中运行下面命令五次，复制五行结�
 [guid]::NewGuid().ToString()
 ```
 
-Reality 私钥可以在 Windows 上用同版本官方 Xray 运行 `xray.exe x25519` 后复制 `PrivateKey`，脚本会根据私钥计算公钥，不会要求你另外输入公钥。新版本 Xray 的输出通常同时显示 `PrivateKey` 和 `Password (PublicKey)`，这里只输入 `PrivateKey` 那一行的值。部署时私钥会明文显示在终端输入行中；Cloudflare API Token 仍使用隐藏输入。
+Reality 私钥可以在 Windows 上用同版本官方 Xray 运行 `xray.exe x25519` 后复制 `PrivateKey`，脚本会根据私钥计算公钥，不会要求你另外输入公钥。新版本 Xray 的输出通常同时显示 `PrivateKey` 和 `Password (PublicKey)`，这里只输入 `PrivateKey` 那一行的值。部署时所有变量都以明文显示在终端输入行中，包括 Reality 私钥和 Cloudflare API Token；Token 不会写入客户端文件或 Git 文件。
 
 Short ID 必须是 2 到 16 位十六进制字符，并且长度为偶数。脚本提示的推荐默认值是：
 
@@ -73,6 +74,8 @@ a1234567
 这个默认值是 8 位十六进制字符串，符合规则；其中包含数字 `4`，而 Short ID 允许使用该数字。你可以直接回车接受，也可以输入自己的值。Short ID 不要使用 `0` 到 `f` 以外的字符。
 
 XHTTP 路径默认是 `/xhttp`。它不是密码，脚本不会随机改变它；如果你要改，必须以 `/` 开头，且不能包含空格、`?` 或 `#`。
+
+部署提示中的域名、端口、IPv4、UUID、私钥、Short ID 和路径如果校验失败，会立即重新询问对应输入；不需要重新运行脚本。五个 UUID 仍需一次粘贴五行，节点基础别名只需输入一次。
 
 脚本不会询问 SSH 密码、订阅密码或 VLESS Encryption 密钥。本版本不启用 VLESS Encryption，因此不需要额外的 `decryption`/`encryption` 字符串。
 
@@ -120,7 +123,7 @@ Zone - Zone - Read
 
 Zone Resources 只选择同时包含两个子域名的那一个 Zone。不要使用 Global API Key，也不要把 Token 写进 GitHub 仓库。
 
-部署时脚本会隐藏输入 Token。acme.sh 会把它保存在 VPS 的 root 配置中供自动续期使用，脚本不会把 Token 打印到终端、客户端文件或 Git 文件中。
+部署时脚本会明文输入 Token。acme.sh 会把它保存在 VPS 的 root 配置中供自动续期使用，脚本不会把 Token 写入客户端文件或 Git 文件中。
 
 ### 4. 配置缓存绕过
 
@@ -138,7 +141,7 @@ Cloudflare 默认不会缓存 POST，但 XHTTP 路径建议明确加入 Cache Ru
 
 脚本默认在没有可复用证书时使用官方 acme.sh 和 Cloudflare DNS-01：
 
-1. 脚本隐藏询问 Cloudflare API Token。
+1. 脚本明文询问 Cloudflare API Token。
 2. acme.sh 创建 `_acme-challenge` TXT 记录。
 3. Let's Encrypt 验证并签发同时覆盖灰云 Reality 域名和橙云 CDN 域名的证书。
 4. 证书安装到 `/etc/xhttp-cdn-deploy/tls/`。
@@ -185,6 +188,8 @@ Reality 域名的 DNS 必须是灰云直连，否则 Reality 流量也会被 Clo
 
 在 Windows v2rayN 中选择导入剪贴板或从文件导入即可。Reality 节点的上传和下载都直接连接 VPS IP；另外四个节点的上传和下载都使用 Cloudflare CDN 域名及对应端口。
 
+部署末尾会询问一段基础别名，并生成五个带端口后缀的链接名称，例如输入 `jp` 会得到 `jp-3869`、`jp-2053`、`jp-2083`、`jp-2087` 和 `jp-2096`。
+
 部署结束时脚本也会把五条完整链接输出到终端，方便直接复制。链接中的 UUID 是访问凭据；终端录屏、远程会话记录、日志采集或复制历史可能留存这些链接，不要把输出贴到公开渠道。客户端文件只允许 root 读取。
 
 ## XHTTP 连接复用与隐私
@@ -222,4 +227,4 @@ Nginx 对四个 CDN 入口和 Reality 本机回落站点关闭访问日志，以
 
 发布清单记录源码 commit、源码树、运行时版本解析渠道和工具包文件哈希。每次部署或更新会把实际安装的 Xray、Xray 安装器提交、acme.sh、Nginx 和 Debian 依赖版本写入 `install-state.env`；因此工具包构建可复现，运行时组件则跟随执行时的官方稳定版和 Debian 软件源。
 
-生成的 Xray 配置位于 `/usr/local/etc/xray/config.json`，Nginx 专用配置位于 `/etc/nginx/conf.d/xhttp-cdn-deploy.conf`。部署前应确认四个 CDN 公网端口、你指定的 Reality 公网端口及相应本机 `+10000` 端口没有被其他服务占用。部署脚本只用于没有现存 Xray 安装和本工具状态目录的新 VPS；后续组件升级通过 `update.sh` 完成。
+生成的 Xray 配置位于 `/usr/local/etc/xray/config.json`，由 root 保有并按 Xray systemd 服务组授予只读权限；部署启动前会用该服务身份验证配置可读且可解析。Nginx 专用配置位于 `/etc/nginx/conf.d/xhttp-cdn-deploy.conf`。部署前应确认四个 CDN 公网端口、你指定的 Reality 公网端口及相应本机 `+10000` 端口没有被其他服务占用。部署脚本只用于没有现存 Xray 安装和本工具状态目录的新 VPS；后续组件升级通过 `update.sh` 完成。

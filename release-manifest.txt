@@ -1,5 +1,5 @@
-source_commit=ddb68c7c06e693b80b68970401bc5d1901053dce
-source_tree=8504e1323cf3c74a78e56a9b40fbe2fd356abdea
+source_commit=02e452b926397318884b3542c6dcb084d11a06d6
+source_tree=d1b306e09297a6446a6a2fb15785e843ba02e63f
 package_name=xhttp-cdn-deploy
 component_versions=resolved_at_install_or_update_time
 xray_release_channel=https://api.github.com/repos/XTLS/Xray-core/releases/latest
@@ -7,8 +7,8 @@ xray_installer_channel=https://api.github.com/repos/XTLS/Xray-install/commits/ma
 acme_release_channel=https://api.github.com/repos/acmesh-official/acme.sh/releases/latest
 debian_packages=latest_candidates_from_configured_debian_repositories
 files_sha256:
-23d7bd7ad539c8ce46e7bc7a9b5a8f0896805cea1f8fb1346dce70c3a344a92f  deploy.sh
+ef2006e5860f3ab8f62c1b624df992de907468b5460bc0d34d9856d754333034  deploy.sh
 87d174f935887bf7fc392cc64a164da4f2d8e54041ca034fe297a022f75571dc  uninstall.sh
-bf42d5e5d49d07928ee21b58fca564dfa1a6b11a9670a650887ee78b1642a8e5  update.sh
+43ede4f420a071b2d3f7b0a649a055143ae2adc5c4e491a60ca978c5b6c953e5  update.sh
 d6c1277cd04802f21e66291624fef99e7766de27130cc6669e3fa7347fb6a7b2  runtime-versions.sh
-99e7780f9ff83838dd420e8de042b7feaa44a50b490ad1b0eac392a4b83f31aa  README.md
+3b56b50d1d7ddca73d93acf894eabe380294c1e7c7b20ce5c20d9f651257a076  README.md

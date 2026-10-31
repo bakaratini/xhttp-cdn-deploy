@@ -46,6 +46,9 @@ XRAY_GROUP_CREATED_BY_TOOL=0
 XRAY_SERVICE_FILE=""
 XRAY_SERVICE_SHA256=""
 XRAY_BINARY_SHA256=""
+XRAY_SERVICE_USER=""
+XRAY_SERVICE_GROUP=""
+XRAY_CONFIG_MODE=""
 ACME_INSTALLED_BY_TOOL=0
 ACME_CERT_ISSUED_BY_TOOL=0
 ACME_DOMAIN=""
@@ -58,6 +61,8 @@ SITE_INDEX_SHA256=""
 XRAY_CONFIG_SHA256=""
 NGINX_CONFIG_SHA256=""
 CLIENT_FILE_SHA256=""
+NODE_NAMES=()
+NODE_ALIAS_BASE=""
 
 log()  { printf '[INFO] %s\n' "$*"; }
 die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
@@ -130,20 +135,15 @@ prompt_value() {
   local answer
 
   if [[ -n "$default_value" ]]; then
-    read -r -u "$PROMPT_FD" -p "$message [$default_value]: " answer
+    if ! read -r -u "$PROMPT_FD" -p "$message [$default_value]: " answer; then
+      die "input ended while reading ${variable}"
+    fi
     answer="${answer:-$default_value}"
   else
-    read -r -u "$PROMPT_FD" -p "$message: " answer
+    if ! read -r -u "$PROMPT_FD" -p "$message: " answer; then
+      die "input ended while reading ${variable}"
+    fi
   fi
-  printf -v "$variable" '%s' "$answer"
-}
-
-prompt_secret() {
-  local variable="$1"
-  local message="$2"
-  local answer
-  read -r -s -u "$PROMPT_FD" -p "$message: " answer
-  printf '\n' >&2
   printf -v "$variable" '%s' "$answer"
 }
 
@@ -151,9 +151,17 @@ prompt_yes_no() {
   local message="$1"
   local default_value="${2:-N}"
   local answer
-  read -r -u "$PROMPT_FD" -p "$message [y/N]: " answer
-  answer="${answer:-$default_value}"
-  [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+  while :; do
+    if ! read -r -u "$PROMPT_FD" -p "$message [y/N]: " answer; then
+      die "input ended while reading confirmation"
+    fi
+    answer="${answer:-$default_value}"
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) printf '[ERROR] 请输入 y/yes 或 n/no。\n' >&2 ;;
+    esac
+  done
 }
 
 valid_domain() {
@@ -220,66 +228,113 @@ detect_ipv4() {
 }
 
 collect_inputs() {
-  local detected_ip
+  local detected_ip port value index previous prompt_label
   REALITY_DOMAIN=""
   CDN_DOMAIN=""
 
   printf '\n%s\n' "${APP_NAME}: one Reality node and four CDN nodes"
   printf '%s\n' "请将 a2 灰云域名用于 Reality；a1 橙云域名用于四个 CDN 端口。证书同时覆盖两者。"
-  prompt_value REALITY_DOMAIN "Reality 灰云域名（a2）/ SNI"
-  prompt_value CDN_DOMAIN "Cloudflare 橙云 CDN 域名（a1）"
-  REALITY_DOMAIN="${REALITY_DOMAIN,,}"
-  CDN_DOMAIN="${CDN_DOMAIN,,}"
-  valid_domain "$REALITY_DOMAIN" || die "invalid Reality domain"
-  valid_domain "$CDN_DOMAIN" || die "invalid CDN domain"
-  [[ "$REALITY_DOMAIN" != "$CDN_DOMAIN" ]] || die "Reality and CDN domains must be different"
+  while :; do
+    prompt_value REALITY_DOMAIN "Reality 灰云域名（a2）/ SNI"
+    REALITY_DOMAIN="${REALITY_DOMAIN,,}"
+    if valid_domain "$REALITY_DOMAIN"; then break; fi
+    printf '[ERROR] Reality 域名格式无效，请重新输入。\n' >&2
+  done
+  while :; do
+    prompt_value CDN_DOMAIN "Cloudflare 橙云 CDN 域名（a1）"
+    CDN_DOMAIN="${CDN_DOMAIN,,}"
+    if ! valid_domain "$CDN_DOMAIN"; then
+      printf '[ERROR] CDN 域名格式无效，请重新输入。\n' >&2
+    elif [[ "$REALITY_DOMAIN" == "$CDN_DOMAIN" ]]; then
+      printf '[ERROR] Reality 域名和 CDN 域名必须不同，请重新输入 CDN 域名。\n' >&2
+    else
+      break
+    fi
+  done
 
-  prompt_value DIRECT_PORT "上下行均直连 Reality 的端口（须与 2053/2083/2087/2096 不同）"
-  [[ "$DIRECT_PORT" =~ ^[0-9]{1,5}$ ]] || die "direct Reality port must be a decimal TCP port"
-  DIRECT_PORT=$((10#$DIRECT_PORT))
-  (( DIRECT_PORT >= 1 && DIRECT_PORT <= 55535 )) ||
-    die "direct Reality port must be between 1 and 55535 so the local fallback port is valid"
-  local port
-  for port in "${PORTS[@]}"; do
-    [[ "$DIRECT_PORT" != "$port" && "$DIRECT_PORT" != "$((port + 10000))" ]] ||
-      die "direct Reality port overlaps a CDN or its local Xray port (${port}, $((port + 10000)))"
+  while :; do
+    prompt_value DIRECT_PORT "上下行均直连 Reality 的端口（须与 2053/2083/2087/2096 不同）"
+    if [[ ! "$DIRECT_PORT" =~ ^[0-9]{1,5}$ ]]; then
+      printf '[ERROR] 端口必须是十进制 TCP 端口，请重新输入。\n' >&2
+      continue
+    fi
+    DIRECT_PORT=$((10#$DIRECT_PORT))
+    if (( DIRECT_PORT < 1 || DIRECT_PORT > 55535 )); then
+      printf '[ERROR] 端口必须在 1 到 55535 之间，请重新输入。\n' >&2
+      continue
+    fi
+    for port in "${PORTS[@]}"; do
+      if [[ "$DIRECT_PORT" == "$port" || "$DIRECT_PORT" == "$((port + 10000))" ]]; then
+        printf '[ERROR] 端口与 CDN 端口或其本机转发端口冲突，请重新输入。\n' >&2
+        continue 2
+      fi
+    done
+    break
   done
 
   detected_ip="$(detect_ipv4)"
-  prompt_value VPS_IPV4 "VPS 公网 IPv4" "$detected_ip"
-  valid_ipv4 "$VPS_IPV4" || die "invalid IPv4 address"
-
-  UUIDS=()
-  local index value previous prompt_label
-  printf '请粘贴五行不同的 UUID，顺序为 Reality 直连、2053、2083、2087、2096：\n' >&2
-  mapfile -t -n 5 -u "$PROMPT_FD" UUIDS
-  ((${#UUIDS[@]} == 5)) || die "exactly five UUID lines are required"
-  for index in 0 1 2 3 4; do
-    value="${UUIDS[$index]%$'\r'}"
-    UUIDS[$index]="$value"
-    if (( index == 0 )); then
-      prompt_label="Reality 直连节点 UUID"
-    else
-      prompt_label="端口 ${PORTS[$((index - 1))]} CDN 节点 UUID"
-    fi
-    valid_uuid "$value" || die "invalid UUID for ${prompt_label}"
-    for previous in "${UUIDS[@]:0:index}"; do
-      [[ "${previous,,}" != "${value,,}" ]] || die "each node must use a different UUID"
-    done
+  while :; do
+    prompt_value VPS_IPV4 "VPS 公网 IPv4" "$detected_ip"
+    if valid_ipv4 "$VPS_IPV4"; then break; fi
+    printf '[ERROR] IPv4 地址格式无效，请重新输入。\n' >&2
   done
 
-  REALITY_PRIVATE_KEY=""
-  prompt_value REALITY_PRIVATE_KEY "Reality 私钥（base64url；输入可见）"
-  [[ -n "$REALITY_PRIVATE_KEY" ]] || die "Reality private key cannot be empty"
+  while :; do
+    UUIDS=()
+    printf '请粘贴五行不同的 UUID，顺序为 Reality 直连、2053、2083、2087、2096：\n' >&2
+    if ! mapfile -t -n 5 -u "$PROMPT_FD" UUIDS; then
+      die "could not read the five UUID lines"
+    fi
+    ((${#UUIDS[@]} == 5)) || die "exactly five UUID lines are required"
+    value=""
+    for index in 0 1 2 3 4; do
+      value="${UUIDS[$index]%$'\r'}"
+      UUIDS[$index]="$value"
+      if (( index == 0 )); then
+        prompt_label="Reality 直连节点 UUID"
+      else
+        prompt_label="端口 ${PORTS[$((index - 1))]} CDN 节点 UUID"
+      fi
+      if ! valid_uuid "$value"; then
+        printf '[ERROR] %s 格式无效，请重新粘贴五行 UUID。\n' "$prompt_label" >&2
+        continue 2
+      fi
+      for previous in "${UUIDS[@]:0:index}"; do
+        if [[ "${previous,,}" == "${value,,}" ]]; then
+          printf '[ERROR] UUID 必须互不相同，请重新粘贴五行 UUID。\n' >&2
+          continue 3
+        fi
+      done
+    done
+    break
+  done
 
-  REALITY_SHORT_ID=""
-  prompt_value REALITY_SHORT_ID "Reality Short ID" "$DEFAULT_SHORT_ID"
-  valid_short_id "$REALITY_SHORT_ID" ||
-    die "Short ID must be 2-16 hexadecimal characters with an even length"
+  while :; do
+    prompt_value REALITY_PRIVATE_KEY "Reality 私钥（base64url；输入可见）"
+    if [[ "$REALITY_PRIVATE_KEY" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
+    printf '[ERROR] Reality 私钥必须是非空 base64url 字符串，请重新输入。\n' >&2
+  done
 
-  XHTTP_PATH=""
-  prompt_value XHTTP_PATH "XHTTP 路径" "$DEFAULT_XHTTP_PATH"
-  valid_xhttp_path "$XHTTP_PATH" || die "invalid XHTTP path"
+  while :; do
+    prompt_value REALITY_SHORT_ID "Reality Short ID" "$DEFAULT_SHORT_ID"
+    if valid_short_id "$REALITY_SHORT_ID"; then break; fi
+    printf '[ERROR] Short ID 必须是 2-16 位偶数长度十六进制字符，请重新输入。\n' >&2
+  done
+
+  while :; do
+    prompt_value XHTTP_PATH "XHTTP 路径" "$DEFAULT_XHTTP_PATH"
+    if valid_xhttp_path "$XHTTP_PATH"; then break; fi
+    printf '[ERROR] XHTTP 路径格式无效，请重新输入。\n' >&2
+  done
+
+  prompt_value NODE_ALIAS_BASE "五个节点的基础别名（将自动追加端口号）" "xhttp"
+  NODE_NAMES=(
+    "${NODE_ALIAS_BASE}-${DIRECT_PORT}"
+    "${NODE_ALIAS_BASE}-2053"
+    "${NODE_ALIAS_BASE}-2083"
+    "${NODE_ALIAS_BASE}-2087"
+    "${NODE_ALIAS_BASE}-2096"
+  )
 }
 
 install_packages() {
@@ -314,6 +369,9 @@ write_install_state() {
     printf 'XRAY_SERVICE_FILE=%q\n' "$XRAY_SERVICE_FILE"
     printf 'XRAY_SERVICE_SHA256=%q\n' "$XRAY_SERVICE_SHA256"
     printf 'XRAY_BINARY_SHA256=%q\n' "$XRAY_BINARY_SHA256"
+    printf 'XRAY_SERVICE_USER=%q\n' "$XRAY_SERVICE_USER"
+    printf 'XRAY_SERVICE_GROUP=%q\n' "$XRAY_SERVICE_GROUP"
+    printf 'XRAY_CONFIG_MODE=%q\n' "$XRAY_CONFIG_MODE"
     printf 'ACME_INSTALLED_BY_TOOL=%q\n' "$ACME_INSTALLED_BY_TOOL"
     printf 'ACME_CERT_ISSUED_BY_TOOL=%q\n' "$ACME_CERT_ISSUED_BY_TOOL"
     printf 'ACME_DOMAIN=%q\n' "$ACME_DOMAIN"
@@ -418,10 +476,16 @@ derive_public_key() {
   fi
 
   local output
-  output="$(/usr/local/bin/xray x25519 -i "$REALITY_PRIVATE_KEY" 2>&1)" ||
-    die "Xray rejected the Reality private key"
-  PUBLIC_KEY="$(awk -F': *' 'tolower($1) ~ /publickey/ { print $2; exit }' <<< "$output")"
-  [[ -n "$PUBLIC_KEY" ]] || die "could not derive the Reality public key from the private key"
+  while :; do
+    if output="$(/usr/local/bin/xray x25519 -i "$REALITY_PRIVATE_KEY" 2>&1)"; then
+      PUBLIC_KEY="$(awk -F': *' 'tolower($1) ~ /publickey/ { print $2; exit }' <<< "$output")"
+      if [[ -n "$PUBLIC_KEY" ]]; then return 0; fi
+    fi
+    printf '[ERROR] Xray 拒绝了 Reality 私钥，请重新输入。\n' >&2
+    prompt_value REALITY_PRIVATE_KEY "Reality 私钥（base64url；输入可见）"
+    [[ "$REALITY_PRIVATE_KEY" =~ ^[A-Za-z0-9_-]+$ ]] ||
+      printf '[ERROR] Reality 私钥必须是非空 base64url 字符串，请重新输入。\n' >&2
+  done
 }
 
 ensure_state_dirs() {
@@ -474,16 +538,20 @@ certificate_is_usable() {
 
 install_existing_certificate() {
   local source_certificate source_key
-  source_certificate=""
-  source_key=""
-  prompt_value source_certificate "已有证书 PEM 绝对路径"
-  prompt_value source_key "已有私钥 PEM 绝对路径"
-  [[ "$source_certificate" == /* && -f "$source_certificate" ]] ||
-    die "certificate path must be an existing absolute path"
-  [[ "$source_key" == /* && -f "$source_key" ]] ||
-    die "private key path must be an existing absolute path"
-  certificate_is_usable "$source_certificate" "$source_key" ||
-    die "证书已过期、未同时覆盖 Reality 和 CDN 域名，或与私钥不匹配"
+  while :; do
+    prompt_value source_certificate "已有证书 PEM 绝对路径"
+    if [[ "$source_certificate" != /* || ! -f "$source_certificate" ]]; then
+      printf '[ERROR] 证书路径必须是已存在的绝对路径，请重新输入。\n' >&2
+      continue
+    fi
+    prompt_value source_key "已有私钥 PEM 绝对路径"
+    if [[ "$source_key" != /* || ! -f "$source_key" ]]; then
+      printf '[ERROR] 私钥路径必须是已存在的绝对路径，请重新输入。\n' >&2
+      continue
+    fi
+    if certificate_is_usable "$source_certificate" "$source_key"; then break; fi
+    printf '[ERROR] 证书已过期、未同时覆盖 Reality 和 CDN 域名，或与私钥不匹配。\n' >&2
+  done
   install -m 600 "$source_certificate" "$CERT_FILE"
   install -m 600 "$source_key" "$KEY_FILE"
   log "using the supplied certificate and private key"
@@ -541,8 +609,11 @@ prepare_certificate() {
   if [[ -f "$ACME_HOME/account.conf" ]] && grep -q '^CF_Token=' "$ACME_HOME/account.conf"; then
     log "using the existing Cloudflare DNS API token saved by acme.sh"
   else
-    prompt_secret cf_token "Cloudflare API Token（Zone DNS Edit + Zone Read）"
-    [[ -n "$cf_token" ]] || die "Cloudflare API Token cannot be empty"
+    while :; do
+      prompt_value cf_token "Cloudflare API Token（Zone DNS Edit + Zone Read；输入可见）"
+      if [[ -n "$cf_token" ]]; then break; fi
+      printf '[ERROR] Cloudflare API Token 不能为空，请重新输入。\n' >&2
+    done
   fi
 
   ensure_acme
@@ -621,6 +692,39 @@ render_xray_config() {
     > "$XRAY_CONFIG_PATH"
   chmod 600 "$XRAY_CONFIG_PATH"
   XRAY_CONFIG_SHA256="$(sha256sum "$XRAY_CONFIG_PATH" | awk '{print $1}')"
+}
+
+configure_xray_config_permissions() {
+  local service_user service_group
+  (( DRY_RUN )) && return 0
+
+  service_user="$(systemctl show --property=User --value xray 2>/dev/null || true)"
+  service_group="$(systemctl show --property=Group --value xray 2>/dev/null || true)"
+  service_user="${service_user:-root}"
+  if [[ -z "$service_group" ]]; then
+    service_group="$(id -gn "$service_user" 2>/dev/null || true)"
+  fi
+  [[ -n "$service_group" ]] || die "could not determine the Xray service group"
+  getent passwd "$service_user" >/dev/null || die "Xray service user does not exist: $service_user"
+  getent group "$service_group" >/dev/null || die "Xray service group does not exist: $service_group"
+
+  XRAY_SERVICE_USER="$service_user"
+  XRAY_SERVICE_GROUP="$service_group"
+  if [[ "$service_user" == root ]]; then
+    chown root:root "$XRAY_CONFIG_PATH"
+    chmod 600 "$XRAY_CONFIG_PATH"
+    XRAY_CONFIG_MODE=600
+  else
+    chown root:"$service_group" "$XRAY_CONFIG_PATH"
+    chmod 640 "$XRAY_CONFIG_PATH"
+    XRAY_CONFIG_MODE=640
+  fi
+  [[ -r "$XRAY_CONFIG_PATH" ]] || die "Xray configuration is not readable by root"
+  if [[ "$service_user" != root ]]; then
+    command -v runuser >/dev/null 2>&1 || die "runuser is required to validate the Xray service account"
+    runuser -u "$service_user" -- test -r "$XRAY_CONFIG_PATH" ||
+      die "Xray service user cannot read $XRAY_CONFIG_PATH"
+  fi
 }
 
 render_nginx_config() {
@@ -702,24 +806,26 @@ url_encode() {
 }
 
 render_client_links() {
-  local direct_server encoded_path port index extra encoded_extra name xmux uuid
+  local direct_server encoded_path port index extra encoded_extra name xmux uuid default_name
   direct_server="$VPS_IPV4"
   encoded_path="$(url_encode "$XHTTP_PATH")"
   xmux='{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}'
   : > "$CLIENT_FILE"
 
-  name="xhttp-reality-direct-${DIRECT_PORT}"
+  default_name="xhttp-reality-direct-${DIRECT_PORT}"
+  name="${NODE_NAMES[0]:-$default_name}"
   extra="$(jq -cn --argjson xmux "$xmux" '{xmux:$xmux}')"
   encoded_extra="$(url_encode "$extra")"
   printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto&extra=%s#%s\n' \
     "${UUIDS[0]}" "$direct_server" "$DIRECT_PORT" \
     "$(url_encode "$REALITY_DOMAIN")" "$(url_encode "$PUBLIC_KEY")" \
-    "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
+    "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$(url_encode "$name")" >> "$CLIENT_FILE"
 
   for index in 0 1 2 3; do
     port="${PORTS[$index]}"
     uuid="${UUIDS[$((index + 1))]}"
-    name="xhttp-tls-cdn-${port}"
+    default_name="xhttp-tls-cdn-${port}"
+    name="${NODE_NAMES[$((index + 1))]:-$default_name}"
     extra="$(jq -cn \
       --argjson xmux "$xmux" \
       '{xmux:$xmux}')"
@@ -727,7 +833,7 @@ render_client_links() {
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=%s&mode=auto&extra=%s#%s\n' \
       "$uuid" "$CDN_DOMAIN" "$port" \
       "$(url_encode "$CDN_DOMAIN")" "$(url_encode "$CDN_DOMAIN")" \
-      "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
+      "$encoded_path" "$encoded_extra" "$(url_encode "$name")" >> "$CLIENT_FILE"
   done
   chmod 600 "$CLIENT_FILE"
   CLIENT_FILE_SHA256="$(sha256sum "$CLIENT_FILE" | awk '{print $1}')"
@@ -750,6 +856,12 @@ write_state() {
     printf 'REALITY_PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
     printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
     printf 'XHTTP_PATH=%q\n' "$XHTTP_PATH"
+    printf 'NODE_ALIAS_BASE=%q\n' "$NODE_ALIAS_BASE"
+    printf 'NODE_NAME_DIRECT=%q\n' "${NODE_NAMES[0]}"
+    printf 'NODE_NAME_2053=%q\n' "${NODE_NAMES[1]}"
+    printf 'NODE_NAME_2083=%q\n' "${NODE_NAMES[2]}"
+    printf 'NODE_NAME_2087=%q\n' "${NODE_NAMES[3]}"
+    printf 'NODE_NAME_2096=%q\n' "${NODE_NAMES[4]}"
     printf 'CERT_FILE=%q\n' "$CERT_FILE"
     printf 'KEY_FILE=%q\n' "$KEY_FILE"
   } > "$temporary"
@@ -761,6 +873,10 @@ validate_services() {
   (( DRY_RUN )) && return 0
   nginx -t
   /usr/local/bin/xray run -test -config "$XRAY_CONFIG_PATH"
+  if [[ "$XRAY_SERVICE_USER" != root ]]; then
+    runuser -u "$XRAY_SERVICE_USER" -- /usr/local/bin/xray run -test -config "$XRAY_CONFIG_PATH" ||
+      die "Xray configuration cannot be parsed by the service account"
+  fi
 }
 
 start_services() {
@@ -811,6 +927,7 @@ main() {
   fi
   write_site
   render_xray_config
+  configure_xray_config_permissions
   render_nginx_config
   render_client_links
   if (( ! DRY_RUN )); then
