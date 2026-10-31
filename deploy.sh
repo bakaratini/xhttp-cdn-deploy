@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-export XHTTP_XRAY_VERSION=v26.10.29
-export XHTTP_XRAY_INSTALL_REF=e42df6a772e60dd7b058f852262c4dbeb0bc231d
-export XHTTP_ACME_VERSION=3.1.6
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
 APP_NAME="xhttp-cdn-deploy"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+. "${SCRIPT_DIR}/runtime-versions.sh"
 DEFAULT_SHORT_ID="a1234567"
 DEFAULT_XHTTP_PATH="/xhttp"
-INTERNAL_XHTTP_PORT=18080
 PORTS=(2053 2083 2087 2096)
+CDN_PORTS=("${PORTS[@]}")
 ACME_INSTALL_URL="https://get.acme.sh"
-XRAY_INSTALL_REF="${XHTTP_XRAY_INSTALL_REF:-main}"
-XRAY_VERSION="${XHTTP_XRAY_VERSION:-latest}"
-ACME_VERSION="${XHTTP_ACME_VERSION:-latest}"
+XRAY_INSTALL_REF=""
+XRAY_VERSION=""
+ACME_VERSION=""
+XRAY_VERSION_INSTALLED=""
+ACME_VERSION_INSTALLED="unavailable"
+NGINX_VERSION_INSTALLED=""
+DEBIAN_PACKAGE_VERSIONS=""
+COMPONENTS_UPDATED_UTC=""
+DEBIAN_PACKAGES=(ca-certificates curl cron jq nginx openssl unzip)
 
 DRY_RUN=0
 DRY_RUN_OUTPUT=""
@@ -30,6 +35,29 @@ CERT_FILE="${CERT_DIR}/fullchain.pem"
 KEY_FILE="${CERT_DIR}/privkey.pem"
 SITE_DIR="/var/www/xhttp-cdn-deploy"
 ACME_HOME="/root/.acme.sh"
+DIRECT_PORT=""
+INSTALL_STATE_FILE="${STATE_DIR}/install-state.env"
+PACKAGE_BASELINE_FILE="${STATE_DIR}/packages.before"
+BACKUP_DIR="${STATE_DIR}/backups"
+OWNED_PACKAGES=""
+XRAY_INSTALLED_BY_TOOL=0
+XRAY_USER_CREATED_BY_TOOL=0
+XRAY_GROUP_CREATED_BY_TOOL=0
+XRAY_SERVICE_FILE=""
+XRAY_SERVICE_SHA256=""
+XRAY_BINARY_SHA256=""
+ACME_INSTALLED_BY_TOOL=0
+ACME_CERT_ISSUED_BY_TOOL=0
+ACME_DOMAIN=""
+XRAY_CONFIG_BACKUP=""
+NGINX_CONFIG_BACKUP=""
+CLIENT_FILE_BACKUP=""
+SITE_DIR_CREATED_BY_TOOL=0
+SITE_INDEX_CREATED_BY_TOOL=0
+SITE_INDEX_SHA256=""
+XRAY_CONFIG_SHA256=""
+NGINX_CONFIG_SHA256=""
+CLIENT_FILE_SHA256=""
 
 log()  { printf '[INFO] %s\n' "$*"; }
 die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
@@ -196,26 +224,42 @@ collect_inputs() {
   REALITY_DOMAIN=""
   CDN_DOMAIN=""
 
-  printf '\n%s\n' "${APP_NAME}: four XHTTP + Reality/CDN nodes"
-  printf '%s\n' "Reality 域名必须是你控制的灰云子域名；证书将同时覆盖它和 CDN 域名。"
-  prompt_value REALITY_DOMAIN "Reality 灰云域名 / SNI"
-  prompt_value CDN_DOMAIN "Cloudflare 橙云 CDN 域名"
+  printf '\n%s\n' "${APP_NAME}: one Reality node and four CDN nodes"
+  printf '%s\n' "请将 a2 灰云域名用于 Reality；a1 橙云域名用于四个 CDN 端口。证书同时覆盖两者。"
+  prompt_value REALITY_DOMAIN "Reality 灰云域名（a2）/ SNI"
+  prompt_value CDN_DOMAIN "Cloudflare 橙云 CDN 域名（a1）"
   REALITY_DOMAIN="${REALITY_DOMAIN,,}"
   CDN_DOMAIN="${CDN_DOMAIN,,}"
   valid_domain "$REALITY_DOMAIN" || die "invalid Reality domain"
   valid_domain "$CDN_DOMAIN" || die "invalid CDN domain"
   [[ "$REALITY_DOMAIN" != "$CDN_DOMAIN" ]] || die "Reality and CDN domains must be different"
 
+  prompt_value DIRECT_PORT "上下行均直连 Reality 的端口（须与 2053/2083/2087/2096 不同）"
+  [[ "$DIRECT_PORT" =~ ^[0-9]{1,5}$ ]] || die "direct Reality port must be a decimal TCP port"
+  DIRECT_PORT=$((10#$DIRECT_PORT))
+  (( DIRECT_PORT >= 1 && DIRECT_PORT <= 55535 )) ||
+    die "direct Reality port must be between 1 and 55535 so the local fallback port is valid"
+  local port
+  for port in "${PORTS[@]}"; do
+    [[ "$DIRECT_PORT" != "$port" && "$DIRECT_PORT" != "$((port + 10000))" ]] ||
+      die "direct Reality port overlaps a CDN or its local Xray port (${port}, $((port + 10000)))"
+  done
+
   detected_ip="$(detect_ipv4)"
   prompt_value VPS_IPV4 "VPS 公网 IPv4" "$detected_ip"
   valid_ipv4 "$VPS_IPV4" || die "invalid IPv4 address"
 
   UUIDS=()
-  local index value
-  for index in 1 2 3 4; do
+  local index value previous prompt_label
+  for index in 0 1 2 3 4; do
     value=""
-    prompt_value value "第 ${index} 个节点 UUID"
-    valid_uuid "$value" || die "invalid UUID for node ${index}"
+    if (( index == 0 )); then
+      prompt_label="Reality 直连节点 UUID"
+    else
+      prompt_label="端口 ${PORTS[$((index - 1))]} CDN 节点 UUID"
+    fi
+    prompt_value value "$prompt_label"
+    valid_uuid "$value" || die "invalid UUID for ${prompt_label}"
     local previous
     for previous in "${UUIDS[@]}"; do
       [[ "${previous,,}" != "${value,,}" ]] || die "each node must use a different UUID"
@@ -242,7 +286,101 @@ install_packages() {
   log "installing Debian dependencies"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl cron jq nginx openssl unzip
+  apt-get install -y --no-install-recommends "${DEBIAN_PACKAGES[@]}"
+  local installed_packages
+  installed_packages="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' |
+    awk -F '\t' '$2 == "installed" { print $1 }' | sort -u)"
+  OWNED_PACKAGES="$(comm -13 "${STATE_DIR}/packages.before" <(printf '%s\n' "$installed_packages" | sed '/^$/d'))"
+  write_install_state
+}
+
+write_install_state() {
+  (( DRY_RUN )) && return 0
+  local temporary="${INSTALL_STATE_FILE}.tmp"
+  {
+    printf 'STATE_VERSION=3\n'
+    printf 'XRAY_INSTALLER_COMMIT=%q\n' "$XRAY_INSTALL_REF"
+    printf 'XRAY_VERSION_RESOLVED=%q\n' "$XRAY_VERSION"
+    printf 'ACME_VERSION_RESOLVED=%q\n' "$ACME_VERSION"
+    printf 'XRAY_VERSION_INSTALLED=%q\n' "$XRAY_VERSION_INSTALLED"
+    printf 'ACME_VERSION_INSTALLED=%q\n' "$ACME_VERSION_INSTALLED"
+    printf 'NGINX_VERSION_INSTALLED=%q\n' "$NGINX_VERSION_INSTALLED"
+    printf 'DEBIAN_PACKAGE_VERSIONS=%q\n' "$DEBIAN_PACKAGE_VERSIONS"
+    printf 'COMPONENTS_UPDATED_UTC=%q\n' "$COMPONENTS_UPDATED_UTC"
+    printf 'XRAY_INSTALLED_BY_TOOL=%q\n' "$XRAY_INSTALLED_BY_TOOL"
+    printf 'XRAY_USER_CREATED_BY_TOOL=%q\n' "$XRAY_USER_CREATED_BY_TOOL"
+    printf 'XRAY_GROUP_CREATED_BY_TOOL=%q\n' "$XRAY_GROUP_CREATED_BY_TOOL"
+    printf 'XRAY_SERVICE_FILE=%q\n' "$XRAY_SERVICE_FILE"
+    printf 'XRAY_SERVICE_SHA256=%q\n' "$XRAY_SERVICE_SHA256"
+    printf 'XRAY_BINARY_SHA256=%q\n' "$XRAY_BINARY_SHA256"
+    printf 'ACME_INSTALLED_BY_TOOL=%q\n' "$ACME_INSTALLED_BY_TOOL"
+    printf 'ACME_CERT_ISSUED_BY_TOOL=%q\n' "$ACME_CERT_ISSUED_BY_TOOL"
+    printf 'ACME_DOMAIN=%q\n' "$ACME_DOMAIN"
+    printf 'OWNED_PACKAGES=%q\n' "$OWNED_PACKAGES"
+    printf 'PACKAGE_BASELINE_FILE=%q\n' "$PACKAGE_BASELINE_FILE"
+    printf 'XRAY_CONFIG_BACKUP=%q\n' "$XRAY_CONFIG_BACKUP"
+    printf 'NGINX_CONFIG_BACKUP=%q\n' "$NGINX_CONFIG_BACKUP"
+    printf 'CLIENT_FILE_BACKUP=%q\n' "$CLIENT_FILE_BACKUP"
+    printf 'CLIENT_FILE_CREATED_BY_TOOL=%q\n' "$([[ -z "$CLIENT_FILE_BACKUP" ]] && printf 1 || printf 0)"
+    printf 'SITE_DIR_CREATED_BY_TOOL=%q\n' "$SITE_DIR_CREATED_BY_TOOL"
+    printf 'SITE_INDEX_CREATED_BY_TOOL=%q\n' "$SITE_INDEX_CREATED_BY_TOOL"
+    printf 'SITE_INDEX_SHA256=%q\n' "$SITE_INDEX_SHA256"
+    printf 'XRAY_CONFIG_SHA256=%q\n' "$XRAY_CONFIG_SHA256"
+    printf 'NGINX_CONFIG_SHA256=%q\n' "$NGINX_CONFIG_SHA256"
+    printf 'CLIENT_FILE_SHA256=%q\n' "$CLIENT_FILE_SHA256"
+    printf 'REALITY_DOMAIN=%q\n' "$REALITY_DOMAIN"
+  } > "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$INSTALL_STATE_FILE"
+}
+
+backup_file() {
+  local path="$1"
+  local variable="$2"
+  [[ -e "$path" ]] || return 0
+  local backup="${BACKUP_DIR}/$(basename "$path").original"
+  cp -a "$path" "$backup"
+  printf -v "$variable" '%s' "$backup"
+}
+
+initialize_install_state() {
+  (( DRY_RUN )) && return 0
+  if [[ -e "$STATE_DIR" ]]; then
+    local state_reality_domain state_path
+    state_path="$INSTALL_STATE_FILE"
+    [[ -f "$state_path" && ! -L "$state_path" ]] ||
+      die "${STATE_DIR} already exists without a resumable installation state"
+    state_reality_domain="$REALITY_DOMAIN"
+    # shellcheck disable=SC1090
+    . "$state_path"
+    [[ "${STATE_VERSION:-}" == 3 && "${XRAY_INSTALLED_BY_TOOL:-}" == 0 ]] ||
+      die "an incomplete component installation exists; use uninstall.sh before retrying"
+    [[ -f "$PACKAGE_BASELINE_FILE" ]] || die "the package baseline is missing; cannot safely resume"
+    [[ ! -e /usr/local/bin/xray && ! -e /usr/local/etc/xray && ! -e /etc/systemd/system/xray.service ]] ||
+      die "Xray installation has already started; use uninstall.sh before retrying"
+    REALITY_DOMAIN="$state_reality_domain"
+    log "resuming an incomplete dependency setup"
+    return 0
+  fi
+  install -d -m 700 "$STATE_DIR" "$BACKUP_DIR"
+  dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' |
+    awk -F '\t' '$2 == "installed" { print $1 }' | sort -u > "$PACKAGE_BASELINE_FILE"
+  backup_file "$XRAY_CONFIG_PATH" XRAY_CONFIG_BACKUP
+  backup_file "$NGINX_CONF_PATH" NGINX_CONFIG_BACKUP
+  backup_file "$CLIENT_FILE" CLIENT_FILE_BACKUP
+  [[ -d "$SITE_DIR" ]] || SITE_DIR_CREATED_BY_TOOL=1
+  if ! getent passwd xray >/dev/null; then XRAY_USER_CREATED_BY_TOOL=1; fi
+  if ! getent group xray >/dev/null; then XRAY_GROUP_CREATED_BY_TOOL=1; fi
+  if [[ ! -x "$ACME_HOME/acme.sh" ]]; then ACME_INSTALLED_BY_TOOL=1; fi
+  write_install_state
+}
+
+require_fresh_xray() {
+  (( DRY_RUN )) && return 0
+  if [[ -e /usr/local/bin/xray || -d /usr/local/etc/xray ]] ||
+     systemctl list-unit-files --no-legend xray.service 2>/dev/null | grep -q '^xray.service'; then
+    die "an Xray installation already exists; refusing to overwrite it"
+  fi
 }
 
 install_xray() {
@@ -250,14 +388,26 @@ install_xray() {
   log "installing official Xray-core ${XRAY_VERSION}"
   local installer
   installer="$(mktemp)"
+  XRAY_INSTALLED_BY_TOOL=1
+  write_install_state
   curl -fsSL "https://raw.githubusercontent.com/XTLS/Xray-install/${XRAY_INSTALL_REF}/install-release.sh" -o "$installer"
-  if [[ "$XRAY_VERSION" == latest ]]; then
-    bash "$installer" install -u root
-  else
-    bash "$installer" install -u root --version "$XRAY_VERSION"
+  if ! bash "$installer" install -u root --version "$XRAY_VERSION"; then
+    rm -f "$installer"
+    die "official Xray installer failed"
   fi
   rm -f "$installer"
   [[ -x /usr/local/bin/xray ]] || die "Xray installation did not produce /usr/local/bin/xray"
+  [[ -f /usr/local/bin/xray && ! -L /usr/local/bin/xray ]] || die "Xray binary is not a regular file"
+  XRAY_BINARY_SHA256="$(sha256sum /usr/local/bin/xray | awk '{print $1}')"
+  XRAY_VERSION_INSTALLED="$(/usr/local/bin/xray version 2>/dev/null | head -n1)"
+  if [[ -f "$XRAY_CONFIG_PATH" && ! -L "$XRAY_CONFIG_PATH" ]]; then
+    XRAY_CONFIG_SHA256="$(sha256sum "$XRAY_CONFIG_PATH" | awk '{print $1}')"
+  fi
+  XRAY_SERVICE_FILE="$(systemctl show --property=FragmentPath --value xray.service 2>/dev/null || true)"
+  if [[ -n "$XRAY_SERVICE_FILE" && -f "$XRAY_SERVICE_FILE" && ! -L "$XRAY_SERVICE_FILE" ]]; then
+    XRAY_SERVICE_SHA256="$(sha256sum "$XRAY_SERVICE_FILE" | awk '{print $1}')"
+  fi
+  write_install_state
 }
 
 derive_public_key() {
@@ -279,8 +429,6 @@ ensure_state_dirs() {
   install -d -m 700 "$STATE_DIR/backups"
   if (( ! DRY_RUN )); then
     install -d -m 755 "$(dirname "$XRAY_CONFIG_PATH")" "$(dirname "$NGINX_CONF_PATH")"
-    backup_file "$XRAY_CONFIG_PATH"
-    backup_file "$NGINX_CONF_PATH"
   fi
 }
 
@@ -341,28 +489,22 @@ install_existing_certificate() {
 }
 
 ensure_acme() {
-  if [[ "$ACME_VERSION" == latest ]] && command -v acme.sh >/dev/null 2>&1; then
-    ACME_BIN="$(command -v acme.sh)"
-    return 0
-  fi
-  if [[ "$ACME_VERSION" != latest && -x "$ACME_HOME/acme.sh" ]] &&
-     "$ACME_HOME/acme.sh" --version 2>/dev/null | grep -Fq "$ACME_VERSION"; then
-    ACME_BIN="$ACME_HOME/acme.sh"
-    return 0
-  fi
-  log "installing official acme.sh ${ACME_VERSION}"
+  log "installing official acme.sh stable release ${ACME_VERSION}"
   local installer
   installer="$(mktemp)"
-  curl -fsSL "$ACME_INSTALL_URL" -o "$installer"
-  if [[ "$ACME_VERSION" == latest ]]; then
-    sh "$installer"
-  else
-    BRANCH="$ACME_VERSION" sh "$installer"
+  write_install_state
+  if ! curl -fsSL --retry 2 --max-time 30 "$ACME_INSTALL_URL" -o "$installer"; then
+    rm -f "$installer"
+    die "could not download the official acme.sh installer"
+  fi
+  if ! BRANCH="$ACME_VERSION" sh "$installer"; then
+    rm -f "$installer"
+    die "official acme.sh installer failed"
   fi
   rm -f "$installer"
   ACME_BIN="$ACME_HOME/acme.sh"
-  [[ -x "$ACME_BIN" ]] || ACME_BIN="$(command -v acme.sh || true)"
-  [[ -n "$ACME_BIN" ]] || die "acme.sh installation failed"
+  [[ -x "$ACME_BIN" ]] || die "acme.sh installation failed"
+  ACME_VERSION_INSTALLED="$("$ACME_BIN" --version 2>/dev/null | tail -n1)"
 }
 
 prepare_certificate() {
@@ -388,6 +530,12 @@ prepare_certificate() {
     return 0
   fi
 
+  if [[ -e "${ACME_HOME}/${REALITY_DOMAIN}_ecc" || \
+        -e "${ACME_HOME}/${REALITY_DOMAIN}_ecc.conf" || \
+        -e "${ACME_HOME}/${REALITY_DOMAIN}.conf" ]]; then
+    die "an ACME certificate lineage for ${REALITY_DOMAIN} already exists; provide a certificate file instead of replacing it"
+  fi
+
   local cf_token=""
   if [[ -f "$ACME_HOME/account.conf" ]] && grep -q '^CF_Token=' "$ACME_HOME/account.conf"; then
     log "using the existing Cloudflare DNS API token saved by acme.sh"
@@ -397,6 +545,9 @@ prepare_certificate() {
   fi
 
   ensure_acme
+  ACME_DOMAIN="$REALITY_DOMAIN"
+  ACME_CERT_ISSUED_BY_TOOL=1
+  write_install_state
   "$ACME_BIN" --set-default-ca --server letsencrypt
   local issue_output
   if [[ -n "$cf_token" ]]; then
@@ -422,15 +573,6 @@ prepare_certificate() {
   certificate_is_usable "$CERT_FILE" "$KEY_FILE" || die "issued certificate validation failed"
 }
 
-backup_file() {
-  local path="$1"
-  [[ -e "$path" ]] || return 0
-  local name timestamp
-  name="$(basename "$path")"
-  timestamp="$(date -u +%Y%m%dT%H%M%S).$$.${RANDOM}"
-  cp -a "$path" "$STATE_DIR/backups/${name}.${timestamp}"
-}
-
 write_site() {
   [[ -e "$SITE_DIR/index.html" ]] && return 0
   cat > "$SITE_DIR/index.html" <<EOF
@@ -439,44 +581,45 @@ write_site() {
 <body><h1>Welcome</h1><p>This site is served by the origin.</p></body></html>
 EOF
   chmod 644 "$SITE_DIR/index.html"
-}
-
-build_internal_clients_json() {
-  printf '%s\n' "${UUIDS[@]}" | jq -Rsc 'split("\n")[:-1] | map({id: ., level: 0})'
+  SITE_INDEX_CREATED_BY_TOOL=1
+  SITE_INDEX_SHA256="$(sha256sum "$SITE_DIR/index.html" | awk '{print $1}')"
+  write_install_state
 }
 
 render_xray_config() {
-  local internal_clients inbounds inbound port target index
-  internal_clients="$(build_internal_clients_json)"
+  local inbounds inbound port target internal_port index uuid
   inbounds='[]'
+
+  target="127.0.0.1:$((DIRECT_PORT + 10000))"
+  inbound="$(jq -cn \
+    --arg id "${UUIDS[0]}" \
+    --argjson port "$DIRECT_PORT" \
+    --arg target "$target" \
+    --arg reality_domain "$REALITY_DOMAIN" \
+    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --arg short_id "$REALITY_SHORT_ID" \
+    --arg path "$XHTTP_PATH" \
+    '{listen:"0.0.0.0", port:$port, protocol:"vless", settings:{clients:[{id:$id, level:0}], decryption:"none"}, streamSettings:{network:"xhttp", security:"reality", realitySettings:{show:false, target:$target, xver:0, serverNames:[$reality_domain], privateKey:$private_key, shortIds:[$short_id]}, xhttpSettings:{host:"", path:$path, mode:"auto"}}, sniffing:{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}}')"
+  inbounds="$(jq -cn --argjson all "$inbounds" --argjson one "$inbound" '$all + [$one]')"
 
   for index in 0 1 2 3; do
     port="${PORTS[$index]}"
-    target="127.0.0.1:$((port + 10000))"
+    internal_port=$((port + 10000))
+    uuid="${UUIDS[$((index + 1))]}"
     inbound="$(jq -cn \
-      --argjson clients "$(jq -n --arg id "${UUIDS[$index]}" '[{id: $id, level: 0}]')" \
-      --argjson port "$port" \
-      --arg target "$target" \
-      --arg reality_domain "$REALITY_DOMAIN" \
-      --arg private_key "$REALITY_PRIVATE_KEY" \
-      --arg short_id "$REALITY_SHORT_ID" \
+      --arg id "$uuid" \
+      --argjson port "$internal_port" \
       --arg path "$XHTTP_PATH" \
-      '{listen:"0.0.0.0", port:$port, protocol:"vless", settings:{clients:$clients, decryption:"none"}, streamSettings:{network:"xhttp", security:"reality", realitySettings:{show:false, target:$target, xver:0, serverNames:[$reality_domain], privateKey:$private_key, shortIds:[$short_id]}, xhttpSettings:{host:"", path:$path, mode:"auto"}}, sniffing:{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}}')"
+      '{listen:"127.0.0.1", port:$port, protocol:"vless", settings:{clients:[{id:$id, level:0}], decryption:"none"}, streamSettings:{network:"xhttp", xhttpSettings:{host:"", path:$path, mode:"auto"}}, sniffing:{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}}')"
     inbounds="$(jq -cn --argjson all "$inbounds" --argjson one "$inbound" '$all + [$one]')"
   done
-
-  inbound="$(jq -cn \
-    --argjson clients "$internal_clients" \
-    --argjson port "$INTERNAL_XHTTP_PORT" \
-    --arg path "$XHTTP_PATH" \
-    '{listen:"127.0.0.1", port:$port, protocol:"vless", settings:{clients:$clients, decryption:"none"}, streamSettings:{network:"xhttp", xhttpSettings:{host:"", path:$path, mode:"auto"}}, sniffing:{enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}}')"
-  inbounds="$(jq -cn --argjson all "$inbounds" --argjson one "$inbound" '$all + [$one]')"
 
   jq -n \
     --argjson inbounds "$inbounds" \
     '{log:{loglevel:"warning"}, inbounds:$inbounds, outbounds:[{protocol:"freedom",tag:"direct"}]}' \
     > "$XRAY_CONFIG_PATH"
   chmod 600 "$XRAY_CONFIG_PATH"
+  XRAY_CONFIG_SHA256="$(sha256sum "$XRAY_CONFIG_PATH" | awk '{print $1}')"
 }
 
 render_nginx_config() {
@@ -491,13 +634,35 @@ render_nginx_config() {
     fi
   fi
   : > "$NGINX_CONF_PATH"
-  for port in "${PORTS[@]}"; do
+  internal_port=$((DIRECT_PORT + 10000))
+  cat >> "$NGINX_CONF_PATH" <<EOF
+server {
+    listen 127.0.0.1:${internal_port} ssl;
+    server_name ${REALITY_DOMAIN};
+
+    access_log off;
+    ssl_certificate ${CERT_FILE};
+    ssl_certificate_key ${KEY_FILE};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    client_max_body_size 0;
+    client_body_timeout 1h;
+
+    location / {
+        root ${SITE_DIR};
+        index index.html;
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+
+EOF
+  for port in "${CDN_PORTS[@]}"; do
     internal_port=$((port + 10000))
     cat >> "$NGINX_CONF_PATH" <<EOF
 server {
-    listen 127.0.0.1:${internal_port} ${http2_listen};
+    listen ${port} ${http2_listen};
 ${http2_directive}
-    server_name ${REALITY_DOMAIN} ${CDN_DOMAIN};
+    server_name ${CDN_DOMAIN};
 
     access_log off;
     ssl_certificate ${CERT_FILE};
@@ -508,7 +673,7 @@ ${http2_directive}
     client_body_timeout 1h;
 
     location ^~ ${XHTTP_PATH} {
-        grpc_pass 127.0.0.1:${INTERNAL_XHTTP_PORT};
+        grpc_pass 127.0.0.1:${internal_port};
         grpc_read_timeout 1h;
         grpc_send_timeout 1h;
         grpc_set_header Host \$host;
@@ -528,6 +693,7 @@ ${http2_directive}
 EOF
   done
   chmod 644 "$NGINX_CONF_PATH"
+  NGINX_CONFIG_SHA256="$(sha256sum "$NGINX_CONF_PATH" | awk '{print $1}')"
 }
 
 url_encode() {
@@ -535,39 +701,35 @@ url_encode() {
 }
 
 render_client_links() {
-  local direct_server encoded_path port index extra encoded_extra name xmux
+  local direct_server encoded_path port index extra encoded_extra name xmux uuid
   direct_server="$VPS_IPV4"
   encoded_path="$(url_encode "$XHTTP_PATH")"
   xmux='{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}'
   : > "$CLIENT_FILE"
 
+  name="xhttp-reality-direct-${DIRECT_PORT}"
+  extra="$(jq -cn --argjson xmux "$xmux" '{xmux:$xmux}')"
+  encoded_extra="$(url_encode "$extra")"
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto&extra=%s#%s\n' \
+    "${UUIDS[0]}" "$direct_server" "$DIRECT_PORT" \
+    "$(url_encode "$REALITY_DOMAIN")" "$(url_encode "$PUBLIC_KEY")" \
+    "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
+
   for index in 0 1 2 3; do
     port="${PORTS[$index]}"
-    if [[ "$port" == "2053" ]]; then
-      name="xhttp-reality-direct-2053"
-      extra="$(jq -cn --argjson xmux "$xmux" '{xmux:$xmux}')"
-      encoded_extra="$(url_encode "$extra")"
-      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto&extra=%s#%s\n' \
-        "${UUIDS[$index]}" "$direct_server" "$port" \
-        "$(url_encode "$REALITY_DOMAIN")" "$(url_encode "$PUBLIC_KEY")" \
-        "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
-      continue
-    fi
-
-    name="xhttp-reality-upload-cdn-download-${port}"
+    uuid="${UUIDS[$((index + 1))]}"
+    name="xhttp-tls-cdn-${port}"
     extra="$(jq -cn \
-      --arg address "$CDN_DOMAIN" \
-      --argjson port "$port" \
-      --arg path "$XHTTP_PATH" \
       --argjson xmux "$xmux" \
-      '{xmux:$xmux,downloadSettings:{address:$address,port:$port,network:"xhttp",security:"tls",tlsSettings:{serverName:$address,allowInsecure:false,alpn:["h2"],fingerprint:"chrome"},xhttpSettings:{host:$address,path:$path,mode:"auto",xmux:$xmux}}}')"
+      '{xmux:$xmux}')"
     encoded_extra="$(url_encode "$extra")"
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto&extra=%s#%s\n' \
-      "${UUIDS[$index]}" "$direct_server" "$port" \
-      "$(url_encode "$REALITY_DOMAIN")" "$(url_encode "$PUBLIC_KEY")" \
-      "$(url_encode "$REALITY_SHORT_ID")" "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=%s&mode=auto&extra=%s#%s\n' \
+      "$uuid" "$CDN_DOMAIN" "$port" \
+      "$(url_encode "$CDN_DOMAIN")" "$(url_encode "$CDN_DOMAIN")" \
+      "$encoded_path" "$encoded_extra" "$name" >> "$CLIENT_FILE"
   done
   chmod 600 "$CLIENT_FILE"
+  CLIENT_FILE_SHA256="$(sha256sum "$CLIENT_FILE" | awk '{print $1}')"
 }
 
 write_state() {
@@ -576,21 +738,19 @@ write_state() {
   {
     printf 'REALITY_DOMAIN=%q\n' "$REALITY_DOMAIN"
     printf 'CDN_DOMAIN=%q\n' "$CDN_DOMAIN"
+    printf 'DIRECT_PORT=%q\n' "$DIRECT_PORT"
     printf 'VPS_IPV4=%q\n' "$VPS_IPV4"
-    printf 'UUID_2053=%q\n' "${UUIDS[0]}"
-    printf 'UUID_2083=%q\n' "${UUIDS[1]}"
-    printf 'UUID_2087=%q\n' "${UUIDS[2]}"
-    printf 'UUID_2096=%q\n' "${UUIDS[3]}"
+    printf 'UUID_DIRECT=%q\n' "${UUIDS[0]}"
+    printf 'UUID_2053=%q\n' "${UUIDS[1]}"
+    printf 'UUID_2083=%q\n' "${UUIDS[2]}"
+    printf 'UUID_2087=%q\n' "${UUIDS[3]}"
+    printf 'UUID_2096=%q\n' "${UUIDS[4]}"
     printf 'REALITY_PRIVATE_KEY=%q\n' "$REALITY_PRIVATE_KEY"
     printf 'REALITY_PUBLIC_KEY=%q\n' "$PUBLIC_KEY"
     printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
     printf 'XHTTP_PATH=%q\n' "$XHTTP_PATH"
     printf 'CERT_FILE=%q\n' "$CERT_FILE"
     printf 'KEY_FILE=%q\n' "$KEY_FILE"
-    printf 'XRAY_VERSION=%q\n' "$(if (( DRY_RUN )); then printf '%s' dry-run; else /usr/local/bin/xray version 2>/dev/null | head -n1; fi)"
-    printf 'XRAY_VERSION_REQUESTED=%q\n' "$XRAY_VERSION"
-    printf 'NGINX_VERSION=%q\n' "$(if (( DRY_RUN )); then printf '%s' dry-run; else nginx -v 2>&1; fi)"
-    printf 'ACME_VERSION=%q\n' "$(if (( DRY_RUN )); then printf '%s' dry-run; elif [[ -x "$ACME_HOME/acme.sh" ]]; then "$ACME_HOME/acme.sh" --version 2>/dev/null | head -n1; else printf '%s' unavailable; fi)"
   } > "$temporary"
   chmod 600 "$temporary"
   mv -f "$temporary" "$state_file"
@@ -618,9 +778,10 @@ print_summary() {
   printf '客户端链接：%s\n' "$CLIENT_FILE"
   printf 'Xray 配置： %s\n' "$XRAY_CONFIG_PATH"
   printf '状态文件：  %s\n' "${STATE_DIR}/config.env"
-  printf '\n请在 VPS / 云厂商防火墙放行 TCP 入站端口：%s\n' "${PORTS[*]}"
-  printf 'Cloudflare CDN 域名：%s（橙云，端口 2083/2087/2096）\n' "$CDN_DOMAIN"
-  printf 'Reality SNI：%s\n\n' "$REALITY_DOMAIN"
+  printf '\n请在 VPS / 云厂商防火墙放行 TCP 入站端口：%s %s\n' "${PORTS[*]}" "$DIRECT_PORT"
+  printf 'Cloudflare CDN 域名：%s（橙云，端口 %s）\n' "$CDN_DOMAIN" "${PORTS[*]}"
+  printf '双向直连 Reality：TCP %s，SNI %s\n' "$DIRECT_PORT" "$REALITY_DOMAIN"
+  printf '双向经 CDN：TCP %s（域名 %s）\n\n' "${PORTS[*]}" "$CDN_DOMAIN"
   cat "$CLIENT_FILE"
 }
 
@@ -629,21 +790,35 @@ main() {
   init_paths
   require_debian_root
   open_prompt_fd
+  if (( ! DRY_RUN )); then
+    require_fresh_xray
+  fi
+  collect_inputs
 
   if (( ! DRY_RUN )); then
+    initialize_install_state
     install_packages
+    resolve_latest_versions || die "could not resolve latest official component versions"
     install_xray
   fi
 
-  collect_inputs
   derive_public_key
   ensure_state_dirs
   prepare_certificate
+  if (( ! DRY_RUN )) && [[ -x "$ACME_HOME/acme.sh" ]] && [[ "$ACME_VERSION_INSTALLED" == unavailable ]]; then
+    ACME_VERSION_INSTALLED="$("$ACME_HOME/acme.sh" --version 2>/dev/null | tail -n1)"
+  fi
   write_site
   render_xray_config
   render_nginx_config
   render_client_links
+  if (( ! DRY_RUN )); then
+    NGINX_VERSION_INSTALLED="$(nginx -v 2>&1)"
+    DEBIAN_PACKAGE_VERSIONS="$(dpkg-query -W -f='${binary:Package}=${Version}\n' "${DEBIAN_PACKAGES[@]}" | sort)"
+    COMPONENTS_UPDATED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
   write_state
+  write_install_state
   validate_services
   start_services
   print_summary

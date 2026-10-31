@@ -1,70 +1,62 @@
-# Debian XHTTP + Reality/CDN 四节点部署包
+# Debian XHTTP + Reality/CDN 五节点部署包
 
 这个工程包面向 Debian 12/13 的 IPv4 VPS。脚本只安装和配置官方 Xray-core、Debian Nginx 和官方 acme.sh，不包含 xpadding、ECH、Hysteria2、Mihomo 或其他扩展功能。
 
-参考的协议拓扑来自 [my-xhttp-cdn-config](https://github.com/Yulinanami/my-xhttp-cdn-config)，脚本实现已经重新整理，只保留本项目需要的四个节点。
+参考的协议拓扑来自 [my-xhttp-cdn-config](https://github.com/Yulinanami/my-xhttp-cdn-config)，脚本实现已经重新整理，只保留本项目需要的五个节点。
 
 ## 节点布局
 
-| VPS 端口 | 上行 | 下行 |
-| ---: | --- | --- |
-| 2053 | XHTTP + Reality，直连 VPS | XHTTP + Reality，直连 VPS |
-| 2083 | XHTTP + Reality，直连 VPS | XHTTP + TLS + Cloudflare CDN |
-| 2087 | XHTTP + Reality，直连 VPS | XHTTP + TLS + Cloudflare CDN |
-| 2096 | XHTTP + Reality，直连 VPS | XHTTP + TLS + Cloudflare CDN |
+| 端口 | 上行 | 下行 |
+| --- | --- | --- |
+| 2053、2083、2087、2096 | XHTTP + TLS + Cloudflare CDN | XHTTP + TLS + Cloudflare CDN |
+| 另行手动指定的端口 | XHTTP + Reality，直连 VPS | XHTTP + Reality，直连 VPS |
 
-四个端口都是 VPS 侧需要放行的 **TCP 入站端口**。VPS 访问外网时由 Xray 使用系统分配的出站端口，脚本不会限制这些端口。
+上述五个端口都是 VPS 侧需要放行的 **TCP 入站端口**。VPS 访问外网时由 Xray 使用系统分配的出站端口，脚本不会限制这些端口。
 
-Cloudflare 支持 2053、2083、2087、2096 这些 HTTPS 端口。脚本只让 Xray 监听公网端口，Nginx 的 TLS 回落端口只监听 `127.0.0.1`，不会额外要求你开放内部端口。
+Cloudflare 支持这四个 HTTPS 端口，它们全部由 Nginx 接收 TLS/HTTP/2，再分别转发给仅监听 `127.0.0.1` 的 Xray 入站。你另外手动指定一个双向直连 Reality 端口，必须与这四个 CDN 端口不同；Xray 在该公网端口监听 Reality。Reality 回落站点只监听本机直连端口加 `10000` 的地址，不需要额外放行内部端口。
 
 ## 执行方式
 
-提交工程后，在本地运行发布构建脚本。它会拒绝 dirty worktree，在干净提交上生成固定 Xray/acme.sh 版本的发布包：
+提交工程后，在本地运行发布构建脚本。它会拒绝 dirty worktree，并从干净提交生成可复现的工具包：
 
 ```bash
 bash scripts/build-release.sh
 ```
 
-若要重建历史版本，可将清单中的版本和安装器提交作为输入传给构建脚本：
+构建产物位于 `dist/releases/<完整源码 SHA>/`，包含独立工具目录和 `.tar.gz` 压缩包，目录内附有部署、更新、卸载脚本、版本解析辅助文件、说明和哈希清单。解压后将工具目录中的文件上传到自己的仓库根目录，再下载并执行脚本：
 
 ```bash
-XHTTP_BUILD_XRAY_VERSION=v26.10.21 \
-XHTTP_BUILD_ACME_VERSION=3.1.6 \
-XHTTP_BUILD_XRAY_INSTALL_REF=e42df6a772e60dd7b058f852262c4dbeb0bc231d \
-bash scripts/build-release.sh
+sudo install -d -m 755 /opt/xhttp-cdn-deploy
+sudo curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/deploy.sh -o /opt/xhttp-cdn-deploy/deploy.sh
+sudo curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/uninstall.sh -o /opt/xhttp-cdn-deploy/uninstall.sh
+sudo curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/update.sh -o /opt/xhttp-cdn-deploy/update.sh
+sudo curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/runtime-versions.sh -o /opt/xhttp-cdn-deploy/runtime-versions.sh
+sudo bash /opt/xhttp-cdn-deploy/deploy.sh
 ```
 
-将生成的 `dist/xhttp-cdn-deploy/` 文件夹内容上传到自己的 GitHub 仓库根目录，然后可以下载并执行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/deploy.sh -o /tmp/xhttp-cdn-deploy.sh
-sudo bash /tmp/xhttp-cdn-deploy.sh
-```
-
-也可以直接使用管道执行。脚本会从 `/dev/tty` 读取交互输入：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/deploy.sh | sudo bash
-```
-
-脚本只接受 Debian 12、Debian 13 和 root 权限。发布包固定 Xray-core、Xray 官方安装器提交和 acme.sh 版本；Nginx 与系统依赖使用 Debian 官方软件源最新可用版本。实际安装的组件版本和源 Git SHA 可在发布清单及 `/etc/xhttp-cdn-deploy/config.env` 中核对。脚本不会自动修改 `ufw`、nftables 或云厂商安全组，请在脚本结束后确认以下 TCP 端口已经放行：
+脚本只接受 Debian 12、Debian 13 和 root 权限，并要求 VPS 上没有现存的 Xray 安装。部署和更新时会解析官方最新稳定版 Xray-core、当前 Xray 官方安装器提交、acme.sh 最新稳定版，以及 Debian 当前配置软件源提供的工具依赖版本。发布包本身可从源码提交复现；各次部署实际解析到的组件版本记录在 `/etc/xhttp-cdn-deploy/install-state.env`。脚本不会自动修改 `ufw`、nftables 或云厂商安全组，请确认以下四个 CDN TCP 端口和你指定的 Reality TCP 端口已经放行：
 
 ```text
-2053 2083 2087 2096
+2053 2083 2087 2096 <Reality 直连端口>
 ```
+
+卸载时运行 `sudo bash /opt/xhttp-cdn-deploy/uninstall.sh --dry-run` 查看处理范围，再运行 `sudo bash /opt/xhttp-cdn-deploy/uninstall.sh` 并输入 `UNINSTALL` 确认；也可用 `--yes` 显式确认。脚本按部署记录的所有权清理文件和组件；部署后被修改、被其他配置使用或无法确认归属的资源会保留并报告。Cloudflare DNS 记录和防火墙规则需要手动管理，不会被卸载脚本修改。
+
+更新时运行 `sudo bash /opt/xhttp-cdn-deploy/update.sh --dry-run` 检查当前配置并查看官方上游版本目标，再运行 `sudo bash /opt/xhttp-cdn-deploy/update.sh` 并输入 `UPDATE` 确认；也可用 `--yes` 显式确认。更新只处理 Xray、acme.sh、Nginx 和本工具依赖的 Debian 软件包，不执行整机升级，也不会重写节点配置、证书或客户端链接。部署时若提供自备证书且没有安装 acme.sh，更新会跳过 acme.sh。
 
 ## 运行前需要准备的输入
 
 脚本不会随机生成身份参数。请提前准备：
 
-1. 四个不同的 UUID。
+1. 五个不同的 UUID。
 2. 一套 Reality 私钥。
 3. 一个 Reality Short ID。
-4. 一个 Reality 伪装/SNI 域名。
-5. 一个自己的 Cloudflare 橙云域名。
-6. 一个 Cloudflare API Token，或者已经签发好的 CDN 域名证书和私钥。
+4. 一个双向直连 Reality 端口，且不与 `2053`、`2083`、`2087`、`2096` 冲突。脚本接受 `1` 到 `55535` 之间的 TCP 端口，并会拒绝与四个 CDN 端口及其本机转发端口数值重叠的输入；还需确保你指定的端口和它加 `10000` 的本机回落端口没有被其他服务占用。
+5. 一个自己的灰云 Reality 域名（记录名 `a2`）。
+6. 一个自己的橙云 CDN 域名（记录名 `a1`）。
+7. 一个 Cloudflare API Token，或者已经签发好的 CDN 域名证书和私钥。
 
-UUID 可以在 Windows PowerShell 中运行下面命令四次，每次复制一条不同结果：
+UUID 可以在 Windows PowerShell 中运行下面命令五次，每次复制一条不同结果：
 
 ```powershell
 [guid]::NewGuid().ToString()
@@ -86,23 +78,23 @@ XHTTP 路径默认是 `/xhttp`。它不是密码，脚本不会随机改变它�
 
 ## Cloudflare 设置
 
-### 1. 添加 CDN DNS 记录
+### 1. 添加 DNS 记录
 
 在 Cloudflare 中打开目标域名所在的 Zone，添加两条 A 记录：
 
 ```text
 类型：A
-名称：cdn
+名称：a1
 内容：VPS 公网 IPv4
 代理状态：已代理（橙色云）
 
 类型：A
-名称：reality
+名称：a2
 内容：同一个 VPS 公网 IPv4
 代理状态：仅 DNS（灰色云）
 ```
 
-把实际记录名输入脚本，例如 `cdn.example.com` 和 `reality.example.com`。脚本只使用一个 CDN 域名，2083、2087、2096 三个节点共用它。两个子域名应属于同一个 Cloudflare Zone，因为 DNS-01 Token 只配置这个 Zone。不要给这两个域名添加指向其他源站的 AAAA 记录；本包按 IPv4 VPS 设计。
+把实际完整域名输入脚本，例如 `a1.example.com` 和 `a2.example.com`。四个 CDN 端口共用 `a1`，且上下行都经过 Cloudflare；`a2` 只用作另行指定的 Reality 直连端口 SNI。两个记录应属于同一个 Cloudflare Zone，因为 DNS-01 Token 只配置这个 Zone。不要给它们添加指向其他源站的 AAAA 记录；本包按 IPv4 VPS 设计。
 
 ### 2. 设置 TLS 模式和 gRPC
 
@@ -135,10 +127,10 @@ Zone Resources 只选择同时包含两个子域名的那一个 Zone。不要使
 Cloudflare 默认不会缓存 POST，但 XHTTP 路径建议明确加入 Cache Rule。规则表达式可以使用：
 
 ```text
-(http.host eq "cdn.example.com" and http.request.uri.path contains "/xhttp")
+(http.host eq "a1.example.com" and http.request.uri.path contains "/xhttp")
 ```
 
-动作选择 Skip cache。把示例域名换成你的 CDN 域名，把路径换成脚本最终使用的 XHTTP 路径。
+动作选择 Skip cache。把示例域名换成你的 `a1` 域名，把路径换成脚本最终使用的 XHTTP 路径。
 
 ## TLS 证书
 
@@ -164,7 +156,7 @@ Windows 客户端只验证 CDN 域名和 Cloudflare 边缘证书。证书续期�
 
 也可以在 Cloudflare 中申请 **Origin CA** 证书后输入文件路径。Origin CA 证书只需要被 Cloudflare 信任，适合 `Full (strict)` 回源；Windows 客户端不会直接连接这个源站证书。不要把 Origin CA 私钥上传到 GitHub。
 
-通过文件路径导入的证书由你自行续期。续期后重新运行脚本，在询问是否替换当前源站证书时回答 `y`，再提供更新后的证书和私钥绝对路径；acme.sh DNS-01 模式才会自动续期并重载 Nginx。
+通过文件路径导入的证书由你自行续期。续期后需手动安装新证书并重载 Nginx。部署脚本只用于新安装，已部署服务请使用独立更新脚本；首次部署已存在同域名的 acme.sh 谱系时会拒绝覆盖，避免修改其他服务的证书配置。
 
 ## Reality 伪装域名怎么选
 
@@ -172,32 +164,32 @@ Windows 客户端只验证 CDN 域名和 Cloudflare 边缘证书。证书续期�
 
 这里有两个不同概念：
 
-- **CDN 域名**：必须是你自己的域名，DNS 指向 VPS，并开启 Cloudflare 橙云。它用于 2083、2087、2096 的下行 TLS/CDN。
+- **CDN 域名**：必须是你自己的域名，DNS 指向 VPS，并开启 Cloudflare 橙云。它用于四个指定端口，且上下行都经过 CDN。
 - **Reality 伪装/SNI 域名**：灰云 DNS 记录直接指向 VPS，作为 Reality TLS 握手里的 `serverName`，不经过 CDN。
 
 Reality 为什么有些教程使用 Apple、Firefox 等公共站点？
 
 Reality 可以把认证失败的 TLS 连接转发给外部真实站点作为 target，因此一些不同的部署会把公共站点的主机名作为 `serverName` 和转发目标。那些域名属于 Apple、Mozilla 等网站，不是用户自己的 DNS 记录，也不能把它们添加到自己的 Zone。
 
-本工程的回落目标是 VPS 本机 Nginx，用于同时接收 Reality 回落和 Cloudflare 的标准 TLS 回源；Nginx 证书必须匹配 Reality SNI，所以本脚本要求使用你控制的灰云域名，并把它和 CDN 域名一起放入证书 SAN。不要在本脚本中输入 `www.apple.com`、`www.mozilla.org` 等第三方域名：你无法为它们签发源站证书。
+本工程的回落目标是 VPS 本机 Nginx，用于接收 Reality 回落和 Cloudflare 的标准 TLS 回源；Nginx 证书必须匹配 Reality SNI，所以本脚本要求使用你控制的灰云域名，并把它和 CDN 域名一起放入证书 SAN。不要在本脚本中输入 `www.apple.com`、`www.mozilla.org` 等第三方域名：你无法为它们签发源站证书。
 
-Reality 域名的 DNS 必须是灰云直连，否则 2053 的直连流量也会被 Cloudflare 接管。Reality 域名和 CDN 域名必须不同。TLS DNS-01 验证不要求开放 VPS 的 80 端口。
+Reality 域名的 DNS 必须是灰云直连，否则 Reality 流量也会被 Cloudflare 接管。Reality 域名和 CDN 域名必须不同。TLS DNS-01 验证不要求开放 VPS 的 80 端口。
 
 ## 客户端文件
 
-部署完成后，四条 v2rayN VLESS 链接保存在：
+部署完成后，五条 v2rayN VLESS 链接保存在：
 
 ```text
 /root/xhttp-cdn-deploy/client-v2rayn.txt
 ```
 
-在 Windows v2rayN 中选择导入剪贴板或从文件导入即可。2053 节点的上传和下载都直接连接 VPS；另外三个节点的上传连接 VPS IP，下载地址使用 Cloudflare CDN 域名和对应端口。
+在 Windows v2rayN 中选择导入剪贴板或从文件导入即可。Reality 节点的上传和下载都直接连接 VPS IP；另外四个节点的上传和下载都使用 Cloudflare CDN 域名及对应端口。
 
-部署结束时脚本也会把四条完整链接输出到终端，方便直接复制。链接中的 UUID 是访问凭据；终端录屏、远程会话记录、日志采集或复制历史可能留存这些链接，不要把输出贴到公开渠道。客户端文件只允许 root 读取。
+部署结束时脚本也会把五条完整链接输出到终端，方便直接复制。链接中的 UUID 是访问凭据；终端录屏、远程会话记录、日志采集或复制历史可能留存这些链接，不要把输出贴到公开渠道。客户端文件只允许 root 读取。
 
 ## XHTTP 连接复用与隐私
 
-四条客户端链接会在 XHTTP `extra` 中明确设置 XMUX，避免连接行为依赖客户端 Xray-core 对未设置值的默认处理：
+五条客户端链接会在 XHTTP `extra` 中明确设置 XMUX，避免连接行为依赖客户端 Xray-core 对未设置值的默认处理：
 
 ```json
 {
@@ -210,15 +202,15 @@ Reality 域名的 DNS 必须是灰云直连，否则 2053 的直连流量也会�
 }
 ```
 
-这些范围来自 [Xray XHTTP 说明](https://github.com/XTLS/Xray-core/discussions/4113)。其中 `maxConcurrency` 达到范围内选定的并发上限后，客户端会创建新的 XMUX client；请求数和可复用时间也有上限。2083、2087、2096 的上行 Reality 和下行 TLS/CDN 都配置同一组值。XMUX 是客户端连接池设置，不会改变服务端协议或端口布局。
+这些范围来自 [Xray XHTTP 说明](https://github.com/XTLS/Xray-core/discussions/4113)。其中 `maxConcurrency` 达到范围内选定的并发上限后，客户端会创建新的 XMUX client；请求数和可复用时间也有上限。五条客户端链接都使用同一组值。XMUX 是客户端连接池设置，不会改变服务端协议或端口布局。
 
-Xray `v26.10.29` 的 [XMUX 单元测试](https://github.com/XTLS/Xray-core/blob/v26.10.29/transport/internet/splithttp/mux_test.go)直接用空 `XmuxConfig` 测试连接池，结果是 64 个并发请求共用一个 XMUX client；这不是完整 XHTTP 配置的默认值。官方 XHTTP 配置构建器在整个 `xmux` 块缺省时会补入 `maxConnections=3`、`hMaxRequestTimes=600-900` 和 `hMaxReusableSecs=1800-3000`。本包显式写入完整参数，避免客户端行为依赖这类默认处理差异。显式配置不代表能够规避封禁。`fp=chrome` 只模拟 TLS ClientHello，不等于 Chrome 浏览器的完整 TLS/HTTP/2 行为；目前没有可靠证据能把这类连接特征与特定封禁事件建立因果关系。
+本包显式写入完整参数，让客户端行为不依赖 Xray 各版本对 XMUX 默认值的处理。显式配置不代表能够规避封禁。`fp=chrome` 只模拟 TLS ClientHello，不等于 Chrome 浏览器的完整 TLS/HTTP/2 行为；目前没有可靠证据能把这类连接特征与特定封禁事件建立因果关系。
 
-另需留意：官方 Xray `v26.10.29` 检查配置时会提示 Reality 监听非 443 端口会增加 IP 被封锁的可能性。本工程的四个指定端口都不是 443，因此这个提示适用于所有节点；XMUX 参数不能消除该风险。
+Reality 直连端口是否触发端口相关提示，以当前安装版 Xray 的配置检查结果为准；XMUX 参数不能消除这类网络风险。
 
-三个 CDN 节点的客户端 TLS 在 Cloudflare 边缘终止，再由 Cloudflare 另建 TLS 连接回源；`Full (strict)` 不是客户端到 VPS 的端到端 TLS。Cloudflare 能看到客户端 IP、连接时间和流量大小，也能读取边缘解密后的 HTTP/XHTTP 路径、头部和请求体字节。代理访问 HTTPS 网站时，目标网站的 TLS 内容仍由客户端加密到目标网站；非 TLS 目标流量没有这层端到端保护。2053 直连可绕过 Cloudflare 这一跳，但 VPS 仍会处理并看到代理流量。
+四个 CDN 节点的客户端 TLS 在 Cloudflare 边缘终止，再由 Cloudflare 另建 TLS 连接回源；`Full (strict)` 不是客户端到 VPS 的端到端 TLS。Cloudflare 能看到客户端 IP、连接时间和流量大小，也能读取边缘解密后的 HTTP/XHTTP 路径、头部和请求体字节。代理访问 HTTPS 网站时，目标网站的 TLS 内容仍由客户端加密到目标网站；非 TLS 目标流量没有这层端到端保护。Reality 直连节点可绕过 Cloudflare 这一跳，但 VPS 仍会处理并看到代理流量。
 
-Nginx 对这四个入口关闭访问日志，以减少本机保存的请求路径和来源记录。Nginx、Xray 或 systemd 的错误/服务日志仍可能记录运行故障信息。
+Nginx 对四个 CDN 入口和 Reality 本机回落站点关闭访问日志，以减少本机保存的请求路径和来源记录。Nginx、Xray 或 systemd 的错误/服务日志仍可能记录运行故障信息。
 
 ## 配置和版本记录
 
@@ -228,6 +220,6 @@ Nginx 对这四个入口关闭访问日志，以减少本机保存的请求路�
 /etc/xhttp-cdn-deploy/config.env
 ```
 
-发布构建会把当时最新的官方稳定 Xray-core 版本、Xray 官方安装器提交和 acme.sh release tag 固定进生成的 `deploy.sh` 与 `release-manifest.txt`。Nginx、curl 等依赖使用 Debian 官方软件源版本。实际安装版本会写入 `config.env`，方便排查和复现部署结果。
+发布清单记录源码 commit、源码树、运行时版本解析渠道和工具包文件哈希。每次部署或更新会把实际安装的 Xray、Xray 安装器提交、acme.sh、Nginx 和 Debian 依赖版本写入 `install-state.env`；因此工具包构建可复现，运行时组件则跟随执行时的官方稳定版和 Debian 软件源。
 
-生成的 Xray 配置位于 `/usr/local/etc/xray/config.json`，Nginx 专用配置位于 `/etc/nginx/conf.d/xhttp-cdn-deploy.conf`。重复运行脚本前应确认四个公网端口没有被其他服务占用；脚本会备份它管理的旧配置到 `/etc/xhttp-cdn-deploy/backups/`。
+生成的 Xray 配置位于 `/usr/local/etc/xray/config.json`，Nginx 专用配置位于 `/etc/nginx/conf.d/xhttp-cdn-deploy.conf`。部署前应确认四个 CDN 公网端口、你指定的 Reality 公网端口及相应本机 `+10000` 端口没有被其他服务占用。部署脚本只用于没有现存 Xray 安装和本工具状态目录的新 VPS；后续组件升级通过 `update.sh` 完成。
