@@ -296,8 +296,8 @@ install_latest_xray() {
     -o "$installer" || { warn "could not download the official Xray installer"; return 1; }
   if [[ "${XHTTP_UPDATE_TEST_MODE:-0}" == 1 ]]; then
     printf '%s\n' "$XRAY_VERSION" > "$(path_of /usr/local/share/xray/.test-version)"
-    printf 'xray-installer %s %s --no-update-service\n' "$XRAY_INSTALL_REF" "$XRAY_VERSION" >> "$XHTTP_UPDATE_TEST_CALL_LOG"
-  elif ! bash "$installer" install -u root --version "$XRAY_VERSION" --no-update-service; then
+    printf 'xray-installer %s install --version %s --no-update-service\n' "$XRAY_INSTALL_REF" "$XRAY_VERSION" >> "$XHTTP_UPDATE_TEST_CALL_LOG"
+  elif ! bash "$installer" install --version "$XRAY_VERSION" --no-update-service; then
     warn "official Xray installer failed"
     return 1
   fi

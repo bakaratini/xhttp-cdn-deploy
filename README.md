@@ -56,13 +56,13 @@ sudo bash /opt/xhttp-cdn-deploy/deploy.sh
 6. 一个自己的橙云 CDN 域名（记录名 `a1`）。
 7. 一个 Cloudflare API Token，或者已经签发好的 CDN 域名证书和私钥。
 
-UUID 可以在 Windows PowerShell 中运行下面命令五次，每次复制一条不同结果：
+UUID 可以在 Windows PowerShell 中运行下面命令五次，复制五行结果到部署提示。输入顺序是 Reality 直连、2053、2083、2087、2096；五条必须互不相同。
 
 ```powershell
 [guid]::NewGuid().ToString()
 ```
 
-Reality 私钥可以在 Windows 上用同版本官方 Xray 运行 `xray.exe x25519` 后复制 `PrivateKey`，脚本会根据私钥计算公钥，不会要求你另外输入公钥。新版本 Xray 的输出通常同时显示 `PrivateKey` 和 `Password (PublicKey)`，这里只输入 `PrivateKey` 那一行的值。
+Reality 私钥可以在 Windows 上用同版本官方 Xray 运行 `xray.exe x25519` 后复制 `PrivateKey`，脚本会根据私钥计算公钥，不会要求你另外输入公钥。新版本 Xray 的输出通常同时显示 `PrivateKey` 和 `Password (PublicKey)`，这里只输入 `PrivateKey` 那一行的值。部署时私钥会明文显示在终端输入行中；Cloudflare API Token 仍使用隐藏输入。
 
 Short ID 必须是 2 到 16 位十六进制字符，并且长度为偶数。脚本提示的推荐默认值是：
 

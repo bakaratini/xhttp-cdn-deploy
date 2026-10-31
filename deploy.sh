@@ -251,24 +251,25 @@ collect_inputs() {
 
   UUIDS=()
   local index value previous prompt_label
+  printf '请粘贴五行不同的 UUID，顺序为 Reality 直连、2053、2083、2087、2096：\n' >&2
+  mapfile -t -n 5 -u "$PROMPT_FD" UUIDS
+  ((${#UUIDS[@]} == 5)) || die "exactly five UUID lines are required"
   for index in 0 1 2 3 4; do
-    value=""
+    value="${UUIDS[$index]%$'\r'}"
+    UUIDS[$index]="$value"
     if (( index == 0 )); then
       prompt_label="Reality 直连节点 UUID"
     else
       prompt_label="端口 ${PORTS[$((index - 1))]} CDN 节点 UUID"
     fi
-    prompt_value value "$prompt_label"
     valid_uuid "$value" || die "invalid UUID for ${prompt_label}"
-    local previous
-    for previous in "${UUIDS[@]}"; do
+    for previous in "${UUIDS[@]:0:index}"; do
       [[ "${previous,,}" != "${value,,}" ]] || die "each node must use a different UUID"
     done
-    UUIDS+=("$value")
   done
 
   REALITY_PRIVATE_KEY=""
-  prompt_secret REALITY_PRIVATE_KEY "Reality 私钥（base64url）"
+  prompt_value REALITY_PRIVATE_KEY "Reality 私钥（base64url；输入可见）"
   [[ -n "$REALITY_PRIVATE_KEY" ]] || die "Reality private key cannot be empty"
 
   REALITY_SHORT_ID=""
@@ -391,7 +392,7 @@ install_xray() {
   XRAY_INSTALLED_BY_TOOL=1
   write_install_state
   curl -fsSL "https://raw.githubusercontent.com/XTLS/Xray-install/${XRAY_INSTALL_REF}/install-release.sh" -o "$installer"
-  if ! bash "$installer" install -u root --version "$XRAY_VERSION"; then
+  if ! bash "$installer" install --version "$XRAY_VERSION"; then
     rm -f "$installer"
     die "official Xray installer failed"
   fi

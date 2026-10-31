@@ -95,7 +95,7 @@ load_state() {
 
 show_plan() {
   printf 'The following tool-managed resources will be removed or restored:\n'
-  (( XRAY_INSTALLED_BY_TOOL )) && printf '  Xray service, binary, data, logs, and tool configuration\n'
+  (( XRAY_INSTALLED_BY_TOOL )) && printf '  Xray installation artifacts, if present\n'
   printf '  Nginx configuration: %s\n' "$NGINX_CONF_PATH"
   printf '  Client link and tool-created site files\n'
   printf '  Local state, certificate copies, and saved deployment credentials\n'
@@ -241,6 +241,37 @@ remove_xray() {
     PRESERVE_TLS=1
     RETAINED_RESOURCES+=("Xray installation and configuration")
     return 0
+  fi
+  local path unit_files xray_artifact=0
+  local -a xray_paths
+  xray_paths=(
+    /usr/local/bin/xray
+    /usr/local/etc/xray/config.json
+    /usr/local/share/xray
+    /var/log/xray
+    /etc/systemd/system/xray.service
+    /etc/systemd/system/xray@.service
+    /etc/systemd/system/xray.service.d
+    /etc/systemd/system/xray@.service.d
+    /etc/logrotate.d/xray
+  )
+  if [[ -n "${XRAY_SERVICE_FILE:-}" ]]; then
+    xray_paths+=("$XRAY_SERVICE_FILE")
+  fi
+  for path in "${xray_paths[@]}"; do
+    path="$(path_of "$path")"
+    if [[ -e "$path" || -L "$path" ]]; then
+      xray_artifact=1
+      break
+    fi
+  done
+  if (( ! xray_artifact )); then
+    unit_files="$(systemctl list-unit-files --no-legend 'xray.service' 'xray@.service' 2>/dev/null || true)"
+    if [[ -z "$unit_files" ]]; then
+      log "Xray was not installed; skipping the upstream removal command"
+      XRAY_REMOVED=1
+      return 0
+    fi
   fi
   local installer_url installer
   installer_url="https://raw.githubusercontent.com/XTLS/Xray-install/${XRAY_INSTALLER_COMMIT}/install-release.sh"
